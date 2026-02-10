@@ -47,13 +47,16 @@ function onInputChange() {
     }
     // 自动识别类型并处理
     const type = detectType(raw);
-    document.getElementById('dataType').textContent = type === 'json' ? 'JSON' : type === 'xml' ? 'XML' : '未知';
+    const typeLabels = { json: 'JSON', xml: 'XML', tostring: 'Java对象', unknown: '未知' };
+    document.getElementById('dataType').textContent = typeLabels[type] || '未知';
     currentType = type;
 
     if (type === 'json') {
         processJson(raw);
     } else if (type === 'xml') {
         processXml(raw);
+    } else if (type === 'tostring') {
+        processToString(raw);
     } else {
         // 尝试作为 JSON 处理以获取错误信息
         processJson(raw);
@@ -63,8 +66,13 @@ function onInputChange() {
 function detectType(s) {
     const t = s.trimStart();
     if (t.startsWith('<')) return 'xml';
-    if (t.startsWith('{') || t.startsWith('[')) return 'json';
-    // 尝试解析
+    if (t.startsWith('{') || t.startsWith('[')) {
+        // 优先尝试标准 JSON 解析
+        try { JSON.parse(s); return 'json'; } catch (e) { }
+        // 检测 Java toString 格式：{key=value, key2=value2}
+        if (/^\{[\s]*[\w.]+\s*=/.test(t)) return 'tostring';
+        return 'json'; // 默认按 JSON 处理（可显示错误提示）
+    }
     try { JSON.parse(s); return 'json'; } catch (e) { }
     if (/<\w/.test(s)) return 'xml';
     return 'unknown';
@@ -442,6 +450,163 @@ function showXmlError(raw, errMsg) {
     msgEl.innerHTML = `<div style="color:var(--danger);font-weight:600;">❌ XML 解析错误</div><div style="margin-top:8px;">${escapeHtml(errMsg)}</div>`;
 }
 
+// ===== Java toString() 格式处理 =====
+// 解析 Java 对象的 toString() 输出，如 {key=value, key2={nested=val}}
+function processToString(raw) {
+    closeErrorPanel();
+    try {
+        const obj = parseJavaToString(raw);
+        if (!obj || typeof obj !== 'object') {
+            throw new Error('无法解析为有效的 Java toString 格式');
+        }
+        currentData = obj;
+        // 转换为 JSON 格式展示
+        const jsonStr = JSON.stringify(obj, null, 2);
+        document.getElementById('formattedCode').innerHTML = highlightJson(jsonStr);
+        renderJsonTree(obj);
+        switchTab('tree');
+        showToast('✓ 已将 Java toString 格式转换为 JSON');
+    } catch (e) {
+        currentData = null;
+        // 显示解析错误
+        const panel = document.getElementById('errorPanel');
+        const msgEl = document.getElementById('errorMessage');
+        panel.classList.remove('hidden');
+        document.getElementById('fixSuggestion').classList.add('hidden');
+        msgEl.innerHTML = `<div style="color:var(--danger);font-weight:600;">❌ Java toString 格式解析错误</div><div style="margin-top:8px;">${escapeHtml(e.message)}</div>`;
+    }
+}
+
+/**
+ * 解析 Java 对象的 toString() 输出为 JavaScript 对象
+ * 支持：嵌套对象 {}、空值、含 [...] 显示标签的值、数值/布尔自动转换、... 截断标记
+ * @param {string} input - Java toString 格式字符串
+ * @returns {object} 解析后的 JavaScript 对象
+ */
+function parseJavaToString(input) {
+    input = input.trim();
+    let pos = 0;
+
+    // 跳过空白字符
+    function skipWhitespace() {
+        while (pos < input.length && /\s/.test(input[pos])) pos++;
+    }
+
+    // 解析一个对象 {...}
+    function parseObject() {
+        if (input[pos] !== '{') return null;
+        pos++; // 跳过 '{'
+        const obj = {};
+
+        while (pos < input.length) {
+            skipWhitespace();
+            if (pos >= input.length) break;
+            if (input[pos] === '}') { pos++; return obj; }
+
+            // 处理截断标记 '...'
+            if (input.substring(pos, pos + 3) === '...') {
+                pos += 3;
+                skipWhitespace();
+                // 跳到当前对象的闭合括号
+                while (pos < input.length && input[pos] !== '}') pos++;
+                if (pos < input.length) pos++;
+                return obj;
+            }
+
+            // 读取 key（直到遇到 '='）
+            let key = '';
+            while (pos < input.length && input[pos] !== '=' && input[pos] !== '}') {
+                key += input[pos];
+                pos++;
+            }
+            key = key.trim();
+
+            if (pos < input.length && input[pos] === '=') {
+                pos++; // 跳过 '='
+            } else {
+                break; // 格式异常，终止
+            }
+
+            // 读取 value
+            skipWhitespace();
+            let value;
+            if (pos < input.length && input[pos] === '{') {
+                // 嵌套对象
+                value = parseObject();
+            } else {
+                // 普通值（可能包含 [...] 显示标签、中文等）
+                value = readPlainValue();
+            }
+
+            if (key) obj[key] = value;
+
+            // 跳过分隔符 ', '
+            skipWhitespace();
+            if (pos < input.length && input[pos] === ',') {
+                pos++;
+                skipWhitespace();
+            }
+        }
+
+        return obj;
+    }
+
+    /**
+     * 读取一个普通值（非嵌套对象）
+     * 通过前瞻判断逗号是键值对分隔符还是值的一部分：
+     *   如果逗号后跟 word= 模式 → 分隔符
+     *   否则 → 值的一部分
+     */
+    function readPlainValue() {
+        let val = '';
+        let braceDepth = 0;
+        let bracketDepth = 0;
+
+        while (pos < input.length) {
+            const ch = input[pos];
+
+            if (ch === '{') braceDepth++;
+            if (ch === '}') {
+                if (braceDepth === 0) break; // 到达父对象的闭合括号
+                braceDepth--;
+            }
+            if (ch === '[') bracketDepth++;
+            if (ch === ']') {
+                if (bracketDepth > 0) bracketDepth--;
+            }
+
+            // 逗号分隔判断
+            if (ch === ',' && braceDepth === 0 && bracketDepth <= 0) {
+                const remaining = input.substring(pos + 1).trimStart();
+                // 前瞻：逗号后面是否紧跟 key= 模式或结束标记
+                if (/^[\w.]+\s*=/.test(remaining) || remaining.startsWith('}') || remaining.startsWith('...')) {
+                    break; // 这是键值对分隔符
+                }
+            }
+
+            val += ch;
+            pos++;
+        }
+
+        val = val.trim();
+
+        // 自动类型转换
+        if (val === '') return '';
+        if (val === 'null') return null;
+        if (val === 'true') return true;
+        if (val === 'false') return false;
+        if (/^-?\d+(\.\d+)?$/.test(val)) return Number(val);
+        return val;
+    }
+
+    // 从顶层开始解析
+    skipWhitespace();
+    if (pos < input.length && input[pos] === '{') {
+        return parseObject();
+    }
+    throw new Error('输入不是有效的 Java toString 格式（应以 { 开头）');
+}
+
 // ===== 工具栏操作 =====
 function doFormat() {
     const raw = inputArea.value.trim();
@@ -458,6 +623,14 @@ function doFormat() {
         inputArea.value = formatXml(raw);
         onInputChange();
         showToast('✓ XML 格式化完成');
+    } else if (type === 'tostring') {
+        // 将 Java toString 格式转换为格式化的 JSON
+        try {
+            const obj = parseJavaToString(raw);
+            inputArea.value = JSON.stringify(obj, null, 2);
+            onInputChange();
+            showToast('✓ 已转换为 JSON 格式');
+        } catch (e) { processToString(raw); }
     }
 }
 
@@ -475,6 +648,13 @@ function doMinify() {
         inputArea.value = raw.replace(/>\s+</g, '><').replace(/\s+/g, ' ').trim();
         onInputChange();
         showToast('✓ XML 已压缩');
+    } else if (type === 'tostring') {
+        try {
+            const obj = parseJavaToString(raw);
+            inputArea.value = JSON.stringify(obj);
+            onInputChange();
+            showToast('✓ 已转换并压缩为 JSON');
+        } catch (e) { processToString(raw); }
     }
 }
 
