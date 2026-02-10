@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JSON / XML 格式化工具</title>
+  <meta name="description" content="专业的 JSON/XML 格式化、校验、排序、智能修复工具">
+  <link rel="stylesheet" href="json-formatter.css">
+</head>
+
+<body>
+  <!-- 顶部标题栏 -->
+  <header class="app-header">
+    <div class="logo">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path d="M12 2L2 7l10 5 10-5-10-5z" />
+        <path d="M2 17l10 5 10-5" />
+        <path d="M2 12l10 5 10-5" />
+      </svg>
+      <h1>JSON / XML 格式化工具</h1>
+    </div>
+    <div class="header-info">
+      <span id="charCount">0 字符</span>
+      <span id="lineCount">0 行</span>
+      <span id="dataType" class="badge">未检测</span>
+      <button onclick="toggleTheme()" class="btn-theme" id="themeToggle" title="切换白天/黑夜模式">
+        <svg id="themeIconMoon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2">
+          <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" />
+        </svg>
+        <svg id="themeIconSun" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2" style="display:none">
+          <circle cx="12" cy="12" r="5" />
+          <path
+            d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42" />
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- 工具栏 -->
+  <div class="toolbar">
+    <div class="btn-group">
+      <button onclick="doFormat()" class="btn btn-primary" title="格式化 (Ctrl+Shift+F)">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M4 6h16M4 12h16M4 18h12" />
+        </svg>
+        格式化
+      </button>
+      <button onclick="doMinify()" class="btn" title="压缩为一行">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M4 12h16" />
+        </svg>
+        压缩
+      </button>
+      <button onclick="doSortKeys()" class="btn" title="按 Key 字母排序">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 6h18M3 12h12M3 18h6" />
+        </svg>
+        排序
+      </button>
+    </div>
+    <div class="btn-group">
+      <button onclick="doCollapseAll()" class="btn" title="折叠所有节点">折叠全部</button>
+      <button onclick="doExpandAll()" class="btn" title="展开所有节点">展开全部</button>
+    </div>
+    <div class="btn-group">
+      <button onclick="doCopyAll()" class="btn" title="复制结果">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="9" y="9" width="13" height="13" rx="2" />
+          <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+        </svg>
+        复制
+      </button>
+      <button onclick="doClear()" class="btn btn-danger" title="清空全部内容">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" />
+        </svg>
+        清空
+      </button>
+    </div>
+  </div>
+
+  <!-- 主内容区 -->
+  <div class="main-content">
+    <!-- 左侧输入区 -->
+    <div class="panel input-panel">
+      <div class="panel-header">
+        <span class="panel-title">输入</span>
+        <button onclick="loadSample()" class="btn btn-sm">加载示例</button>
+      </div>
+      <div class="editor-wrapper">
+        <div class="line-numbers" id="lineNumbers"></div>
+        <textarea id="inputArea" placeholder="在此粘贴 JSON 或 XML 内容...&#10;&#10;支持自动识别格式类型&#10;支持智能错误检测与修复建议"
+          spellcheck="false"></textarea>
+      </div>
+    </div>
+
+    <!-- 右侧输出区 -->
+    <div class="panel output-panel">
+      <div class="panel-header">
+        <span class="panel-title">输出</span>
+        <div class="output-tabs">
+          <button class="tab active" data-tab="formatted" onclick="switchTab('formatted')">格式化</button>
+          <button class="tab" data-tab="tree" onclick="switchTab('tree')">树形视图</button>
+        </div>
+      </div>
+      <div id="formattedOutput" class="output-content active">
+        <pre id="formattedPre"><code id="formattedCode"></code></pre>
+      </div>
+      <div id="treeOutput" class="output-content">
+        <div class="search-bar">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8" />
+            <path d="M21 21l-4.35-4.35" />
+          </svg>
+          <input type="text" id="searchInput" placeholder="搜索字段名..." oninput="onSearchInput()" />
+          <span id="searchCount" class="search-count"></span>
+          <button onclick="searchPrev()" class="btn-search-nav" title="上一个">▲</button>
+          <button onclick="searchNext()" class="btn-search-nav" title="下一个">▼</button>
+          <button onclick="clearSearch()" class="btn-search-nav" title="清除搜索" style="font-size:14px">✕</button>
+        </div>
+        <div id="searchPath" class="search-path"></div>
+        <div id="jsonTree"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 错误/修复提示面板 -->
+  <div id="errorPanel" class="error-panel hidden">
+    <div class="error-header">
+      <span class="error-icon">⚠️</span>
+      <span class="error-title" id="errorTitle">解析错误</span>
+      <button onclick="closeErrorPanel()" class="btn-close">✕</button>
+    </div>
+    <div class="error-body">
+      <div id="errorMessage" class="error-msg"></div>
+      <div id="fixSuggestion" class="fix-suggestion hidden">
+        <div class="fix-header">
+          <span>💡 智能修复建议</span>
+          <button onclick="applyFix()" class="btn btn-sm btn-primary">应用修复</button>
+        </div>
+        <div id="diffView" class="diff-view"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast 提示 -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="json-formatter.js"></script>
+</body>
+
+</html>
