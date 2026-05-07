@@ -2,11 +2,13 @@
 let currentData = null;       // 当前解析成功的数据
 let currentType = null;       // 'json' | 'xml'
 let fixedContent = null;      // 智能修复后的内容
+const MAX_UNWRAP_DEPTH = 3;
 const inputArea = document.getElementById('inputArea');
 const mainContent = document.querySelector('.main-content');
 const inputPanel = document.querySelector('.input-panel');
 const outputPanel = document.querySelector('.output-panel');
 const panelDivider = document.getElementById('panelDivider');
+const PANEL_MIN_WIDTH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--panel-min-width'), 10) || 280;
 
 // ===== 初始化事件 =====
 inputArea.addEventListener('input', debounce(onInputChange, 300));
@@ -48,19 +50,27 @@ function isStructuredString(value) {
 function decodeWrappedString(raw) {
     const text = raw.trim();
     if (text.length < 2 || text[0] !== '\'' || text[text.length - 1] !== '\'') return null;
-    return text.slice(1, -1)
-        .replace(/\\\\/g, '\\')
-        .replace(/\\'/g, '\'')
-        .replace(/\\"/g, '"')
-        .replace(/\\n/g, '\n')
-        .replace(/\\r/g, '\r')
-        .replace(/\\t/g, '\t');
+    let decoded = '';
+    for (let i = 1; i < text.length - 1; i++) {
+        const ch = text[i];
+        if (ch !== '\\' || i === text.length - 2) {
+            decoded += ch;
+            continue;
+        }
+        const next = text[++i];
+        if (next === 'n') decoded += '\n';
+        else if (next === 'r') decoded += '\r';
+        else if (next === 't') decoded += '\t';
+        else if (next === '\'' || next === '"' || next === '\\') decoded += next;
+        else decoded += `\\${next}`;
+    }
+    return decoded;
 }
 
 function unwrapStructuredJsonString(raw) {
     let candidate = raw.trim();
     let wasUnwrapped = false;
-    for (let depth = 0; depth < 3; depth++) {
+    for (let depth = 0; depth < MAX_UNWRAP_DEPTH; depth++) {
         let parsed;
         try {
             parsed = JSON.parse(candidate);
@@ -478,7 +488,7 @@ function processXml(raw) {
         }
         currentData = raw;
         const formatted = formatXml(doc, raw);
-        document.getElementById('formattedCode').innerHTML = highlightXml(escapeHtml(formatted));
+        renderXmlOutput(formatted);
         switchTab('formatted');
         clearSearch();
         // XML 不创建树形视图
@@ -497,7 +507,7 @@ function formatXml(docOrXml, rawXml = '') {
     const lines = [];
     const declaration = extractXmlDeclaration(rawXml || (typeof docOrXml === 'string' ? docOrXml : ''));
     if (declaration) lines.push(declaration);
-    Array.from(doc.childNodes).forEach(node => serializeXmlNode(node, 0, lines));
+    Array.from(doc.childNodes).forEach(node => serializeXmlNode(node, 0, lines, false));
     return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }
 
@@ -506,7 +516,7 @@ function extractXmlDeclaration(xml) {
     return match ? match[1] : '';
 }
 
-function serializeXmlNode(node, level, lines) {
+function serializeXmlNode(node, level, lines, preserveWhitespace) {
     const indent = '  '.repeat(level);
     if (node.nodeType === Node.PROCESSING_INSTRUCTION_NODE) {
         if (node.target.toLowerCase() !== 'xml') lines.push(`${indent}<?${node.target} ${node.data}?>`);
@@ -526,30 +536,31 @@ function serializeXmlNode(node, level, lines) {
         return;
     }
     if (node.nodeType === Node.TEXT_NODE) {
-        const text = (node.nodeValue || '').replace(/\s+/g, ' ').trim();
+        const text = preserveWhitespace ? (node.nodeValue || '') : (node.nodeValue || '').replace(/\s+/g, ' ').trim();
         if (text) lines.push(`${indent}${escapeXmlText(text)}`);
         return;
     }
     if (node.nodeType !== Node.ELEMENT_NODE) return;
 
+    const nextPreserveWhitespace = preserveWhitespace || node.getAttribute('xml:space') === 'preserve';
     const attrs = Array.from(node.attributes || [])
         .map(attr => ` ${attr.name}="${escapeXmlAttribute(attr.value)}"`)
         .join('');
     const children = Array.from(node.childNodes || []).filter(child => {
-        return !(child.nodeType === Node.TEXT_NODE && !(child.nodeValue || '').trim());
+        return nextPreserveWhitespace || !(child.nodeType === Node.TEXT_NODE && !(child.nodeValue || '').trim());
     });
 
     if (children.length === 0) {
         lines.push(`${indent}<${node.nodeName}${attrs}/>`);
         return;
     }
-    if (children.length === 1 && children[0].nodeType === Node.TEXT_NODE) {
+    if (children.length === 1 && children[0].nodeType === Node.TEXT_NODE && !nextPreserveWhitespace) {
         lines.push(`${indent}<${node.nodeName}${attrs}>${escapeXmlText((children[0].nodeValue || '').trim())}</${node.nodeName}>`);
         return;
     }
 
     lines.push(`${indent}<${node.nodeName}${attrs}>`);
-    children.forEach(child => serializeXmlNode(child, level + 1, lines));
+    children.forEach(child => serializeXmlNode(child, level + 1, lines, nextPreserveWhitespace));
     lines.push(`${indent}</${node.nodeName}>`);
 }
 
@@ -571,13 +582,78 @@ function minifyXml(raw) {
     return declaration && !serialized.startsWith('<?xml') ? `${declaration}${serialized}` : serialized;
 }
 
-function highlightXml(str) {
-    return str
-        .replace(/(&lt;!--[\s\S]*?--&gt;)/g, '<span class="xml-comment">$1</span>')
-        .replace(/(&lt;!\[CDATA\[[\s\S]*?\]\]&gt;)/g, '<span class="xml-cdata">$1</span>')
-        .replace(/(&lt;\?)([\w:-]+)([\s\S]*?\?&gt;)/g, '$1<span class="xml-tag">$2</span>$3')
-        .replace(/(&lt;\/?)([\w:-]+)/g, '$1<span class="xml-tag">$2</span>')
-        .replace(/([\w:-]+)(=)(&quot;[^&]*&quot;)/g, '<span class="xml-attr">$1</span>$2<span class="xml-value">$3</span>');
+function renderXmlOutput(xml) {
+    const codeEl = document.getElementById('formattedCode');
+    codeEl.textContent = '';
+    codeEl.appendChild(buildXmlFragment(xml));
+}
+
+function buildXmlFragment(xml) {
+    const fragment = document.createDocumentFragment();
+    const tokenRegex = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<\/?[\w:-]+(?:\s+[\w:-]+(?:="[^"]*")?)*\s*\/?>/g;
+    let lastIndex = 0;
+    let match;
+    while ((match = tokenRegex.exec(xml))) {
+        if (match.index > lastIndex) fragment.appendChild(document.createTextNode(xml.slice(lastIndex, match.index)));
+        appendXmlToken(fragment, match[0]);
+        lastIndex = tokenRegex.lastIndex;
+    }
+    if (lastIndex < xml.length) fragment.appendChild(document.createTextNode(xml.slice(lastIndex)));
+    return fragment;
+}
+
+function appendXmlToken(fragment, token) {
+    if (token.startsWith('<!--')) {
+        appendXmlSpan(fragment, 'xml-comment', token);
+        return;
+    }
+    if (token.startsWith('<![CDATA[')) {
+        appendXmlSpan(fragment, 'xml-cdata', token);
+        return;
+    }
+    if (token.startsWith('<?')) {
+        fragment.appendChild(document.createTextNode('<?'));
+        const body = token.slice(2, -2).trim();
+        const firstSpace = body.search(/\s/);
+        const name = firstSpace === -1 ? body : body.slice(0, firstSpace);
+        appendXmlSpan(fragment, 'xml-tag', name);
+        if (firstSpace !== -1) fragment.appendChild(document.createTextNode(body.slice(firstSpace)));
+        fragment.appendChild(document.createTextNode('?>'));
+        return;
+    }
+
+    const isClosing = token.startsWith('</');
+    const isSelfClosing = token.endsWith('/>');
+    const inner = token.slice(isClosing ? 2 : 1, token.length - (isSelfClosing ? 2 : 1));
+    const nameMatch = inner.match(/^([\w:-]+)/);
+    const tagName = nameMatch ? nameMatch[1] : inner.trim();
+    const attrText = nameMatch ? inner.slice(tagName.length) : '';
+
+    fragment.appendChild(document.createTextNode(isClosing ? '</' : '<'));
+    appendXmlSpan(fragment, 'xml-tag', tagName);
+    appendXmlAttributes(fragment, attrText);
+    fragment.appendChild(document.createTextNode(isSelfClosing ? '/>' : '>'));
+}
+
+function appendXmlAttributes(fragment, attrText) {
+    let lastIndex = 0;
+    const attrRegex = /([\w:-]+)(=)("[^"]*")/g;
+    let match;
+    while ((match = attrRegex.exec(attrText))) {
+        if (match.index > lastIndex) fragment.appendChild(document.createTextNode(attrText.slice(lastIndex, match.index)));
+        appendXmlSpan(fragment, 'xml-attr', match[1]);
+        fragment.appendChild(document.createTextNode(match[2]));
+        appendXmlSpan(fragment, 'xml-value', match[3]);
+        lastIndex = attrRegex.lastIndex;
+    }
+    if (lastIndex < attrText.length) fragment.appendChild(document.createTextNode(attrText.slice(lastIndex)));
+}
+
+function appendXmlSpan(fragment, className, text) {
+    const span = document.createElement('span');
+    span.className = className;
+    span.textContent = text;
+    fragment.appendChild(span);
 }
 
 function showXmlError(raw, errMsg) {
@@ -926,12 +1002,13 @@ function initPanelResize() {
 function startPanelResize(e) {
     e.preventDefault();
     const rect = mainContent.getBoundingClientRect();
-    const minWidth = 280;
+    const maxWidth = rect.width - PANEL_MIN_WIDTH;
     mainContent.classList.add('resizing');
     document.body.classList.add('is-resizing');
 
     const onMove = event => {
-        const nextWidth = Math.min(rect.width - minWidth, Math.max(minWidth, event.clientX - rect.left));
+        const targetWidth = event.clientX - rect.left;
+        const nextWidth = Math.min(maxWidth, Math.max(PANEL_MIN_WIDTH, targetWidth));
         inputPanel.style.flex = `0 0 ${nextWidth}px`;
         outputPanel.style.flex = '1 1 0';
     };
@@ -957,8 +1034,8 @@ function clampPanelWidth() {
     const rect = mainContent.getBoundingClientRect();
     const current = parseFloat(inputPanel.style.flexBasis);
     if (!Number.isFinite(current)) return;
-    const minWidth = 280;
-    const clamped = Math.min(rect.width - minWidth, Math.max(minWidth, current));
+    const maxWidth = rect.width - PANEL_MIN_WIDTH;
+    const clamped = Math.min(maxWidth, Math.max(PANEL_MIN_WIDTH, current));
     inputPanel.style.flex = `0 0 ${clamped}px`;
 }
 
@@ -985,7 +1062,8 @@ function onSearchInput() {
     allNodes.forEach(el => {
         const text = el.textContent.replace(/"/g, '').replace(/:\s*$/, '').toLowerCase();
         if (text.includes(keyword)) {
-            el.classList.add(el.dataset.searchType === 'value' ? 'search-highlight-value' : 'search-highlight');
+            const searchType = el.dataset.searchType === 'value' ? 'value' : 'key';
+            el.classList.add(searchType === 'value' ? 'search-highlight-value' : 'search-highlight');
             searchMatches.push(el);
             // 自动展开所有父级折叠节点
             expandParents(el);

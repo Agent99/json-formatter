@@ -15,6 +15,8 @@
     --success: #3fb950;
     --warning: #d29922;
     --danger: #f85149;
+    --panel-min-width: 280px;
+    --error-panel-max-height: 420px;
     --json-key: #ff7b72;
     --json-string: #a5d6ff;
     --json-number: #79c0ff;
@@ -220,7 +222,7 @@ body {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    min-width: 280px;
+    min-width: var(--panel-min-width);
 }
 
 .input-panel {
@@ -635,7 +637,7 @@ body.is-resizing {
     border-radius: var(--radius-lg);
     box-shadow: var(--shadow);
     z-index: 100;
-    max-height: min(44vh, 420px);
+    max-height: min(44vh, var(--error-panel-max-height));
     overflow-y: auto;
     animation: fadeInUp 0.2s ease;
 }
