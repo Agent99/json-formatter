@@ -47,7 +47,7 @@ function isStructuredString(value) {
     return typeof value === 'string' && /^[\[{]/.test(value.trim());
 }
 
-function decodeWrappedString(raw) {
+function decodeSingleQuotedString(raw) {
     const text = raw.trim();
     if (text.length < 2 || text[0] !== '\'' || text[text.length - 1] !== '\'') return null;
     let decoded = '';
@@ -81,7 +81,7 @@ function unwrapStructuredJsonString(raw) {
             parsed = JSON.parse(candidate);
         } catch (e) {
             if (!wasUnwrapped) {
-                const decoded = decodeWrappedString(candidate);
+                const decoded = decodeSingleQuotedString(candidate);
                 if (decoded && isStructuredString(decoded)) {
                     candidate = decoded;
                     wasUnwrapped = true;
@@ -114,7 +114,7 @@ function getStructuredFixCandidate(raw) {
         const parsed = unwrapStructuredJsonString(raw);
         return parsed.wasUnwrapped ? JSON.stringify(parsed.value, null, 2) : null;
     } catch (e) {
-        const decoded = decodeWrappedString(raw);
+        const decoded = decodeSingleQuotedString(raw);
         return isStructuredString(decoded) ? decoded.trim() : null;
     }
 }
@@ -494,15 +494,9 @@ function closeErrorPanel() {
 function processXml(raw) {
     closeErrorPanel();
     try {
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(raw, 'application/xml');
-        const errorNode = doc.querySelector('parsererror');
-        if (errorNode) {
-            showXmlError(raw, errorNode.textContent);
-            return;
-        }
+        const doc = parseXmlDocument(raw);
         currentData = raw;
-        const formatted = formatXml(doc, raw);
+        const formatted = formatXmlFromDocument(doc, raw);
         renderXmlOutput(formatted);
         switchTab('formatted');
         clearSearch();
@@ -518,14 +512,20 @@ function processXml(raw) {
     }
 }
 
-function formatXml(docOrXml, rawXml = '') {
-    const doc = typeof docOrXml === 'string'
-        ? new DOMParser().parseFromString(docOrXml, 'application/xml')
-        : docOrXml;
-    const errorNode = doc.querySelector?.('parsererror');
+function parseXmlDocument(raw) {
+    const doc = new DOMParser().parseFromString(raw, 'application/xml');
+    const errorNode = doc.querySelector('parsererror');
     if (errorNode) throw new Error(errorNode.textContent);
+    return doc;
+}
+
+function formatXml(rawXml) {
+    return formatXmlFromDocument(parseXmlDocument(rawXml), rawXml);
+}
+
+function formatXmlFromDocument(doc, rawXml = '') {
     const lines = [];
-    const declaration = extractXmlDeclaration(rawXml || (typeof docOrXml === 'string' ? docOrXml : ''));
+    const declaration = extractXmlDeclaration(rawXml);
     if (declaration) lines.push(declaration);
     Array.from(doc.childNodes).forEach(node => serializeXmlNode(node, 0, lines, false));
     return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
@@ -600,10 +600,7 @@ function escapeXmlAttribute(value) {
 }
 
 function minifyXml(raw) {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(raw, 'application/xml');
-    const errorNode = doc.querySelector('parsererror');
-    if (errorNode) throw new Error(errorNode.textContent);
+    const doc = parseXmlDocument(raw);
     const declaration = extractXmlDeclaration(raw);
     const serialized = new XMLSerializer().serializeToString(doc);
     return declaration && !serialized.startsWith('<?xml') ? `${declaration}${serialized}` : serialized;
@@ -862,7 +859,7 @@ function doFormat() {
         } catch (e) { processJson(raw); }
     } else if (type === 'xml') {
         try {
-            inputArea.value = formatXml(raw, raw);
+            inputArea.value = formatXml(raw);
             onInputChange();
             showToast('✓ XML 格式化完成');
         } catch (e) { showXmlError(raw, e.message); }
@@ -1092,7 +1089,7 @@ function onSearchInput() {
     allNodes.forEach(el => {
         const text = el.textContent.replace(/"/g, '').replace(/:\s*$/, '').toLowerCase();
         if (text.includes(keyword)) {
-            const searchType = el.dataset.searchType === 'value' ? 'value' : 'key';
+            const searchType = getSearchType(el);
             el.classList.add(searchType === 'value' ? 'search-highlight-value' : 'search-highlight');
             searchMatches.push(el);
             // 自动展开所有父级折叠节点
@@ -1149,8 +1146,12 @@ function updateSearchInfo() {
     }
     document.getElementById('searchCount').textContent = `${searchIndex + 1}/${searchMatches.length}`;
     const path = active.dataset.path || '';
-    const label = active.dataset.searchType === 'value' ? '值' : '字段';
+    const label = getSearchType(active) === 'value' ? '值' : '字段';
     document.getElementById('searchPath').textContent = path ? `${label}：${path}` : '';
+}
+
+function getSearchType(el) {
+    return el?.dataset.searchType === 'value' ? 'value' : 'key';
 }
 
 function clearSearch() {
