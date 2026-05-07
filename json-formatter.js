@@ -539,7 +539,7 @@ function extractXmlDeclaration(xml) {
 function serializeXmlNode(node, level, lines, preserveWhitespace) {
     const indent = '  '.repeat(level);
     if (node.nodeType === Node.PROCESSING_INSTRUCTION_NODE) {
-        if (node.target.toLowerCase() !== 'xml') lines.push(`${indent}<?${node.target} ${node.data}?>`);
+        if (node.target.toLowerCase() !== 'xml') lines.push(`${indent}<?${node.target}${node.data ? ` ${node.data}` : ''}?>`);
         return;
     }
     if (node.nodeType === Node.DOCUMENT_TYPE_NODE) {
@@ -1017,7 +1017,10 @@ function toggleTheme() {
 
 // ===== 左右面板拖拽 =====
 function initPanelResize() {
-    if (!panelDivider || !mainContent || !inputPanel || !outputPanel) return;
+    if (!panelDivider || !mainContent || !inputPanel || !outputPanel) {
+        console.warn('面板拖拽初始化失败：缺少必要的 DOM 节点');
+        return;
+    }
     panelDivider.addEventListener('pointerdown', startPanelResize);
     panelDivider.addEventListener('dblclick', resetPanelWidth);
     window.addEventListener('resize', clampPanelWidth);
