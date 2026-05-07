@@ -53,11 +53,16 @@ function decodeWrappedString(raw) {
     let decoded = '';
     for (let i = 1; i < text.length - 1; i++) {
         const ch = text[i];
-        if (ch !== '\\' || i === text.length - 2) {
+        if (ch !== '\\') {
             decoded += ch;
             continue;
         }
-        const next = text[++i];
+        const next = text[i + 1];
+        if (next === undefined) {
+            decoded += '\\';
+            continue;
+        }
+        i++;
         if (next === 'n') decoded += '\n';
         else if (next === 'r') decoded += '\r';
         else if (next === 't') decoded += '\t';
@@ -102,6 +107,16 @@ function formatStructuredJson(raw, indent = 2) {
         text: JSON.stringify(parsed.value, null, indent),
         wasUnwrapped: parsed.wasUnwrapped
     };
+}
+
+function getStructuredFixCandidate(raw) {
+    try {
+        const parsed = unwrapStructuredJsonString(raw);
+        return parsed.wasUnwrapped ? JSON.stringify(parsed.value, null, 2) : null;
+    } catch (e) {
+        const decoded = decodeWrappedString(raw);
+        return isStructuredString(decoded) ? decoded.trim() : null;
+    }
 }
 
 // ===== 输入变化处理 =====
@@ -389,7 +404,7 @@ function showJsonError(raw, error) {
 
 function tryAutoFix(raw) {
     const fixes = [
-        { name: '解包字符串化 JSON', fn: s => { const r = decodeWrappedString(s); return isStructuredString(r) ? r.trim() : null; }, desc: '将字符串化 JSON 自动反转义为标准 JSON' },
+        { name: '解包字符串化 JSON', fn: s => getStructuredFixCandidate(s), desc: '将字符串化 JSON 自动反转义为标准 JSON' },
         { name: '移除尾部逗号', fn: s => s.replace(/,\s*([\]}])/g, '$1'), desc: '移除了对象/数组末尾多余的逗号' },
         { name: '单引号→双引号', fn: s => s.replace(/'/g, '"'), desc: '将单引号替换为标准的双引号' },
         { name: '补全缺失引号', fn: s => s.replace(/{\s*(\w+)\s*:/g, '{"$1":').replace(/,\s*(\w+)\s*:/g, ',"$1":'), desc: '为未加引号的 Key 添加了双引号' },
@@ -492,7 +507,12 @@ function processXml(raw) {
         switchTab('formatted');
         clearSearch();
         // XML 不创建树形视图
-        document.getElementById('jsonTree').innerHTML = '<div style="color:var(--text-muted);padding:20px;text-align:center;">树形视图仅支持 JSON 格式</div>';
+        const xmlHint = document.createElement('div');
+        xmlHint.style.cssText = 'color:var(--text-muted);padding:20px;text-align:center;';
+        xmlHint.textContent = '树形视图仅支持 JSON 格式';
+        const treeEl = document.getElementById('jsonTree');
+        treeEl.textContent = '';
+        treeEl.appendChild(xmlHint);
     } catch (e) {
         showXmlError(raw, e.message);
     }
@@ -536,7 +556,7 @@ function serializeXmlNode(node, level, lines, preserveWhitespace) {
         return;
     }
     if (node.nodeType === Node.TEXT_NODE) {
-        const text = preserveWhitespace ? (node.nodeValue || '') : (node.nodeValue || '').replace(/\s+/g, ' ').trim();
+        const text = preserveWhitespace ? (node.nodeValue || '') : normalizeXmlText(node.nodeValue || '');
         if (text) lines.push(`${indent}${escapeXmlText(text)}`);
         return;
     }
@@ -555,7 +575,7 @@ function serializeXmlNode(node, level, lines, preserveWhitespace) {
         return;
     }
     if (children.length === 1 && children[0].nodeType === Node.TEXT_NODE && !nextPreserveWhitespace) {
-        lines.push(`${indent}<${node.nodeName}${attrs}>${escapeXmlText((children[0].nodeValue || '').trim())}</${node.nodeName}>`);
+        lines.push(`${indent}<${node.nodeName}${attrs}>${escapeXmlText(normalizeXmlText(children[0].nodeValue || ''))}</${node.nodeName}>`);
         return;
     }
 
@@ -566,6 +586,13 @@ function serializeXmlNode(node, level, lines, preserveWhitespace) {
 
 function escapeXmlText(value) {
     return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function normalizeXmlText(value) {
+    return value
+        .replace(/[^\S\r\n]+/g, ' ')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
 }
 
 function escapeXmlAttribute(value) {
@@ -1032,7 +1059,10 @@ function resetPanelWidth() {
 function clampPanelWidth() {
     if (!inputPanel.style.flexBasis) return;
     const rect = mainContent.getBoundingClientRect();
-    const current = parseFloat(inputPanel.style.flexBasis);
+    const basis = inputPanel.style.flexBasis;
+    const current = basis.endsWith('%')
+        ? rect.width * parseFloat(basis) / 100
+        : parseFloat(basis);
     if (!Number.isFinite(current)) return;
     const maxWidth = rect.width - PANEL_MIN_WIDTH;
     const clamped = Math.min(maxWidth, Math.max(PANEL_MIN_WIDTH, current));
@@ -1111,10 +1141,15 @@ function activateSearchMatch(index) {
 
 // 更新搜索计数和路径显示
 function updateSearchInfo() {
-    document.getElementById('searchCount').textContent = `${searchIndex + 1}/${searchMatches.length}`;
     const active = searchMatches[searchIndex];
-    const path = active?.dataset.path || '';
-    const label = active?.dataset.searchType === 'value' ? '值' : '字段';
+    if (!active) {
+        document.getElementById('searchCount').textContent = searchMatches.length ? `0/${searchMatches.length}` : '';
+        document.getElementById('searchPath').textContent = '';
+        return;
+    }
+    document.getElementById('searchCount').textContent = `${searchIndex + 1}/${searchMatches.length}`;
+    const path = active.dataset.path || '';
+    const label = active.dataset.searchType === 'value' ? '值' : '字段';
     document.getElementById('searchPath').textContent = path ? `${label}：${path}` : '';
 }
 
