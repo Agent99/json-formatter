@@ -2,7 +2,7 @@
 
 一款零依赖、单页面的 JSON & XML 在线格式化工具，支持智能修复、交互式树形视图、字段搜索、主题切换等功能。
 
-> **在线使用**：直接双击 `json-formatter.html` 在浏览器中打开，开箱即用。
+> **在线使用**：直接双击 `index.html` 在浏览器中打开，开箱即用。
 
 ## ✨ 功能特性
 
@@ -12,17 +12,20 @@
 | **Java 对象转换**   | 支持解析 Java `toString()` 格式（如 `{a=1, b=2}`）并转换为 JSON |
 | **格式化 / 压缩**   | 一键美化或压缩为单行                                                |
 | **交互式树形视图**  | JSON 解析后自动展示，支持节点折叠/展开                              |
-| **字段搜索跳转**    | 搜索字段名，高亮匹配并支持 ▲▼ 跳转，显示完整层级路径              |
+| **字段/值搜索跳转** | 搜索字段名或值，高亮匹配并支持 ▲▼ 跳转，显示完整层级路径         |
 | **悬停路径提示**    | 鼠标悬停字段名时显示完整 JSON 路径（如 `$.data.list.name`）       |
 | **任意层级复制**    | 每个节点（对象/数组/叶子）均可独立复制                              |
 | **Key 排序**        | 递归按 A-Z 排序所有 JSON Key                                        |
 | **智能错误修复**    | 精确定位错误行号，6 种自动修复策略，差异对比可视化                  |
+| **字符串化 JSON**   | 自动识别并反转义 `"{\"a\":1}"` 这类双重编码内容                   |
+| **可拖拽分栏**      | 左右面板支持拖拽调整宽度，双击分隔线可恢复默认比例                  |
+| **增强 XML 支持**   | 更好处理声明、注释、CDATA、自闭合标签的格式化与高亮                |
 | **白天 / 黑夜主题** | 右上角一键切换，偏好自动记忆                                        |
 
 ## 📁 项目结构
 
 ```
-├── json-formatter.html   # 页面结构
+├── index.html            # 页面结构
 ├── json-formatter.css    # 样式（含白天/黑夜双主题）
 ├── json-formatter.js     # 全部交互逻辑
 └── README.md             # 本文件
@@ -32,9 +35,9 @@
 
 ```bash
 # 无需安装任何依赖，直接用浏览器打开
-start json-formatter.html        # Windows
-open json-formatter.html         # macOS
-xdg-open json-formatter.html     # Linux
+start index.html        # Windows
+open index.html         # macOS
+xdg-open index.html     # Linux
 ```
 
 ## ⌨️ 快捷键

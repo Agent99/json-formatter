@@ -2,7 +2,13 @@
 let currentData = null;       // 当前解析成功的数据
 let currentType = null;       // 'json' | 'xml'
 let fixedContent = null;      // 智能修复后的内容
+const MAX_UNWRAP_DEPTH = 3;
 const inputArea = document.getElementById('inputArea');
+const mainContent = document.querySelector('.main-content');
+const inputPanel = document.querySelector('.input-panel');
+const outputPanel = document.querySelector('.output-panel');
+const panelDivider = document.getElementById('panelDivider');
+const PANEL_MIN_WIDTH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--panel-min-width'), 10) || 280;
 
 // ===== 初始化事件 =====
 inputArea.addEventListener('input', debounce(onInputChange, 300));
@@ -11,6 +17,7 @@ inputArea.addEventListener('keydown', handleTabKey);
 document.addEventListener('keydown', e => {
     if (e.ctrlKey && e.shiftKey && e.key === 'F') { e.preventDefault(); doFormat(); }
 });
+initPanelResize();
 updateLineNumbers();
 
 // ===== 工具函数 =====
@@ -34,6 +41,82 @@ function copyToClipboard(text) {
 
 function escapeHtml(s) {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function isStructuredString(value) {
+    return typeof value === 'string' && /^[\[{]/.test(value.trim());
+}
+
+function decodeSingleQuotedString(raw) {
+    const text = raw.trim();
+    if (text.length < 2 || text[0] !== '\'' || text[text.length - 1] !== '\'') return null;
+    let decoded = '';
+    for (let i = 1; i < text.length - 1; i++) {
+        const ch = text[i];
+        if (ch !== '\\') {
+            decoded += ch;
+            continue;
+        }
+        const next = text[i + 1];
+        if (next === undefined) {
+            decoded += '\\';
+            continue;
+        }
+        i++;
+        if (next === 'n') decoded += '\n';
+        else if (next === 'r') decoded += '\r';
+        else if (next === 't') decoded += '\t';
+        else if (next === '\'' || next === '"' || next === '\\') decoded += next;
+        else decoded += `\\${next}`;
+    }
+    return decoded;
+}
+
+function unwrapStructuredJsonString(raw) {
+    let candidate = raw.trim();
+    let wasUnwrapped = false;
+    for (let depth = 0; depth < MAX_UNWRAP_DEPTH; depth++) {
+        let parsed;
+        try {
+            parsed = JSON.parse(candidate);
+        } catch (e) {
+            if (!wasUnwrapped) {
+                const decoded = decodeSingleQuotedString(candidate);
+                if (decoded && isStructuredString(decoded)) {
+                    candidate = decoded;
+                    wasUnwrapped = true;
+                    continue;
+                }
+            }
+            throw e;
+        }
+        if (isStructuredString(parsed)) {
+            candidate = parsed.trim();
+            wasUnwrapped = true;
+            continue;
+        }
+        return { value: parsed, wasUnwrapped };
+    }
+    return { value: JSON.parse(candidate), wasUnwrapped };
+}
+
+function formatStructuredJson(raw, indent = 2) {
+    const parsed = unwrapStructuredJsonString(raw);
+    return {
+        value: parsed.value,
+        text: JSON.stringify(parsed.value, null, indent),
+        wasUnwrapped: parsed.wasUnwrapped
+    };
+}
+
+function getStructuredFixCandidate(raw) {
+    try {
+        const parsed = unwrapStructuredJsonString(raw);
+        return parsed.wasUnwrapped ? JSON.stringify(parsed.value, null, 2) : null;
+    } catch (e) {
+        const decoded = decodeSingleQuotedString(raw);
+        return isStructuredString(decoded) ? decoded.trim() : null;
+    }
 }
 
 // ===== 输入变化处理 =====
@@ -109,10 +192,10 @@ function handleTabKey(e) {
 function processJson(raw) {
     closeErrorPanel();
     try {
-        const obj = JSON.parse(raw);
-        currentData = obj;
-        renderFormattedJson(obj);
-        renderJsonTree(obj);
+        const parsed = formatStructuredJson(raw);
+        currentData = parsed.value;
+        renderFormattedJson(parsed.value);
+        renderJsonTree(parsed.value);
         // JSON 自动切换到树形视图，让用户直接看到可交互的树
         switchTab('tree');
     } catch (e) {
@@ -148,6 +231,8 @@ function renderJsonTree(obj) {
     const container = document.getElementById('jsonTree');
     container.innerHTML = '';
     container.appendChild(buildTreeNode('root', obj, '$', true));
+    if (document.getElementById('searchInput').value.trim()) onSearchInput();
+    else clearSearch();
 }
 
 function buildTreeNode(key, value, parentPath, isRoot) {
@@ -177,6 +262,7 @@ function buildTreeNode(key, value, parentPath, isRoot) {
             const keyEl = document.createElement('span');
             keyEl.className = 'tree-key';
             keyEl.dataset.path = currentPath;
+            keyEl.dataset.searchType = 'key';
             keyEl.title = currentPath;
             keyEl.textContent = `"${key}": `;
             line.appendChild(keyEl);
@@ -185,6 +271,7 @@ function buildTreeNode(key, value, parentPath, isRoot) {
         // 类型标签
         const typeEl = document.createElement('span');
         typeEl.className = 'tree-type';
+        typeEl.dataset.path = currentPath;
         typeEl.textContent = isArray ? `Array[${count}]` : `Object{${count}}`;
         line.appendChild(typeEl);
 
@@ -216,12 +303,15 @@ function buildTreeNode(key, value, parentPath, isRoot) {
         const keyEl = document.createElement('span');
         keyEl.className = 'tree-key';
         keyEl.dataset.path = currentPath;
+        keyEl.dataset.searchType = 'key';
         keyEl.title = currentPath;
         keyEl.textContent = `"${key}": `;
         line.appendChild(keyEl);
 
         const valEl = document.createElement('span');
         valEl.className = 'tree-value';
+        valEl.dataset.path = currentPath;
+        valEl.dataset.searchType = 'value';
         if (typeof value === 'string') {
             valEl.className += ' json-string';
             valEl.textContent = `"${value}"`;
@@ -258,6 +348,7 @@ function showJsonError(raw, error) {
     const panel = document.getElementById('errorPanel');
     const msgEl = document.getElementById('errorMessage');
     const fixEl = document.getElementById('fixSuggestion');
+    document.getElementById('errorTitle').textContent = 'JSON 解析提示';
     panel.classList.remove('hidden');
 
     // 解析错误位置
@@ -276,12 +367,14 @@ function showJsonError(raw, error) {
 
     // 构建错误上下文
     const lines = raw.split('\n');
-    let contextHtml = `<div style="margin-bottom:12px;color:var(--danger);font-weight:600;">❌ ${escapeHtml(errMsg)}</div>`;
+    const locationText = position >= 0 ? `第 ${lineNum} 行，第 ${colNum} 列附近` : '当前输入';
+    let contextHtml = `<div class="error-summary">❌ ${locationText}存在 JSON 语法错误</div>`;
+    contextHtml += `<div class="error-hint">${escapeHtml(errMsg)}</div>`;
 
     if (position >= 0 && lineNum <= lines.length) {
         const start = Math.max(0, lineNum - 3);
         const end = Math.min(lines.length, lineNum + 2);
-        contextHtml += '<div style="margin-top:8px;">';
+        contextHtml += '<details class="error-details"><summary class="error-detail-toggle">查看错误上下文</summary><div class="error-context">';
         for (let i = start; i < end; i++) {
             const ln = i + 1;
             const isErr = ln === lineNum;
@@ -293,7 +386,7 @@ function showJsonError(raw, error) {
                 contextHtml += `<div class="error-pointer" style="color:var(--danger);">${pointer} 错误位置 (第 ${lineNum} 行, 第 ${colNum} 列)</div>`;
             }
         }
-        contextHtml += '</div>';
+        contextHtml += '</div></details>';
     }
     msgEl.innerHTML = contextHtml;
 
@@ -311,6 +404,7 @@ function showJsonError(raw, error) {
 
 function tryAutoFix(raw) {
     const fixes = [
+        { name: '解包字符串化 JSON', fn: s => getStructuredFixCandidate(s), desc: '将字符串化 JSON 自动反转义为标准 JSON' },
         { name: '移除尾部逗号', fn: s => s.replace(/,\s*([\]}])/g, '$1'), desc: '移除了对象/数组末尾多余的逗号' },
         { name: '单引号→双引号', fn: s => s.replace(/'/g, '"'), desc: '将单引号替换为标准的双引号' },
         { name: '补全缺失引号', fn: s => s.replace(/{\s*(\w+)\s*:/g, '{"$1":').replace(/,\s*(\w+)\s*:/g, ',"$1":'), desc: '为未加引号的 Key 添加了双引号' },
@@ -334,8 +428,7 @@ function tryAutoFix(raw) {
         const result = fix.fn(raw);
         if (result && result !== raw) {
             try {
-                JSON.parse(result);
-                return { result: JSON.stringify(JSON.parse(result), null, 2), description: fix.desc };
+                return { result: formatStructuredJson(result).text, description: fix.desc };
             } catch (e) { }
         }
     }
@@ -352,8 +445,7 @@ function tryAutoFix(raw) {
     }
     if (combined !== raw) {
         try {
-            JSON.parse(combined);
-            return { result: JSON.stringify(JSON.parse(combined), null, 2), description: '组合修复：' + appliedFixes.join('；') };
+            return { result: formatStructuredJson(combined).text, description: '组合修复：' + appliedFixes.join('；') };
         } catch (e) { }
     }
     return null;
@@ -402,52 +494,199 @@ function closeErrorPanel() {
 function processXml(raw) {
     closeErrorPanel();
     try {
-        const parser = new DOMParser();
-        const doc = parser.parseFromString(raw, 'application/xml');
-        const errorNode = doc.querySelector('parsererror');
-        if (errorNode) {
-            showXmlError(raw, errorNode.textContent);
-            return;
-        }
+        const doc = parseXmlDocument(raw);
         currentData = raw;
-        const formatted = formatXml(raw);
-        document.getElementById('formattedCode').innerHTML = highlightXml(escapeHtml(formatted));
+        const formatted = formatXmlFromDocument(doc, raw);
+        renderXmlOutput(formatted);
+        switchTab('formatted');
+        clearSearch();
         // XML 不创建树形视图
-        document.getElementById('jsonTree').innerHTML = '<div style="color:var(--text-muted);padding:20px;text-align:center;">树形视图仅支持 JSON 格式</div>';
+        const xmlHint = document.createElement('div');
+        xmlHint.style.cssText = 'color:var(--text-muted);padding:20px;text-align:center;';
+        xmlHint.textContent = '树形视图仅支持 JSON 格式';
+        const treeEl = document.getElementById('jsonTree');
+        treeEl.textContent = '';
+        treeEl.appendChild(xmlHint);
     } catch (e) {
         showXmlError(raw, e.message);
     }
 }
 
-function formatXml(xml) {
-    let formatted = '';
-    let indent = 0;
-    const tab = '  ';
-    // 移除现有缩进
-    xml = xml.replace(/(>)\s*(<)/g, '$1\n$2');
-    const lines = xml.split('\n');
-    lines.forEach(line => {
-        line = line.trim();
-        if (!line) return;
-        if (line.match(/^<\/\w/)) indent--;
-        formatted += tab.repeat(Math.max(0, indent)) + line + '\n';
-        if (line.match(/^<\w[^>]*[^\/]>.*$/) && !line.match(/^<\w[^>]*>.*<\/\w/)) indent++;
-    });
-    return formatted.trim();
+function parseXmlDocument(raw) {
+    const doc = new DOMParser().parseFromString(raw, 'application/xml');
+    const errorNode = doc.querySelector('parsererror');
+    if (errorNode) throw new Error(errorNode.textContent);
+    return doc;
 }
 
-function highlightXml(str) {
-    return str
-        .replace(/(&lt;\/?)([\w:-]+)/g, '$1<span class="xml-tag">$2</span>')
-        .replace(/([\w:-]+)(=)(&quot;[^&]*&quot;)/g, '<span class="xml-attr">$1</span>$2<span class="xml-value">$3</span>');
+function formatXml(rawXml) {
+    return formatXmlFromDocument(parseXmlDocument(rawXml), rawXml);
+}
+
+function formatXmlFromDocument(doc, rawXml = '') {
+    const lines = [];
+    const declaration = extractXmlDeclaration(rawXml);
+    if (declaration) lines.push(declaration);
+    Array.from(doc.childNodes).forEach(node => serializeXmlNode(node, 0, lines, false));
+    return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function extractXmlDeclaration(xml) {
+    const match = xml.match(/^\s*(<\?xml[\s\S]*?\?>)/i);
+    return match ? match[1] : '';
+}
+
+function serializeXmlNode(node, level, lines, preserveWhitespace) {
+    const indent = '  '.repeat(level);
+    if (node.nodeType === Node.PROCESSING_INSTRUCTION_NODE) {
+        if (node.target.toLowerCase() !== 'xml') lines.push(`${indent}<?${node.target}${node.data ? ` ${node.data}` : ''}?>`);
+        return;
+    }
+    if (node.nodeType === Node.DOCUMENT_TYPE_NODE) {
+        const subset = node.internalSubset ? ` [${node.internalSubset}]` : '';
+        lines.push(`${indent}<!DOCTYPE ${node.name}${subset}>`);
+        return;
+    }
+    if (node.nodeType === Node.COMMENT_NODE) {
+        lines.push(`${indent}<!--${node.nodeValue || ''}-->`);
+        return;
+    }
+    if (node.nodeType === Node.CDATA_SECTION_NODE) {
+        lines.push(`${indent}<![CDATA[${node.nodeValue || ''}]]>`);
+        return;
+    }
+    if (node.nodeType === Node.TEXT_NODE) {
+        const text = preserveWhitespace ? (node.nodeValue || '') : normalizeXmlText(node.nodeValue || '');
+        if (text) lines.push(`${indent}${escapeXmlText(text)}`);
+        return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+    const nextPreserveWhitespace = preserveWhitespace || node.getAttribute('xml:space') === 'preserve';
+    const attrs = Array.from(node.attributes || [])
+        .map(attr => ` ${attr.name}="${escapeXmlAttribute(attr.value)}"`)
+        .join('');
+    const children = Array.from(node.childNodes || []).filter(child => {
+        return nextPreserveWhitespace || !(child.nodeType === Node.TEXT_NODE && !(child.nodeValue || '').trim());
+    });
+
+    if (children.length === 0) {
+        lines.push(`${indent}<${node.nodeName}${attrs}/>`);
+        return;
+    }
+    if (children.length === 1 && children[0].nodeType === Node.TEXT_NODE && !nextPreserveWhitespace) {
+        lines.push(`${indent}<${node.nodeName}${attrs}>${escapeXmlText(normalizeXmlText(children[0].nodeValue || ''))}</${node.nodeName}>`);
+        return;
+    }
+
+    lines.push(`${indent}<${node.nodeName}${attrs}>`);
+    children.forEach(child => serializeXmlNode(child, level + 1, lines, nextPreserveWhitespace));
+    lines.push(`${indent}</${node.nodeName}>`);
+}
+
+function escapeXmlText(value) {
+    return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function normalizeXmlText(value) {
+    return value
+        .replace(/[^\S\r\n]+/g, ' ')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+function escapeXmlAttribute(value) {
+    return escapeXmlText(value).replace(/"/g, '&quot;');
+}
+
+function minifyXml(raw) {
+    const doc = parseXmlDocument(raw);
+    const declaration = extractXmlDeclaration(raw);
+    const serialized = new XMLSerializer().serializeToString(doc);
+    return declaration && !serialized.startsWith('<?xml') ? `${declaration}${serialized}` : serialized;
+}
+
+function renderXmlOutput(xml) {
+    const codeEl = document.getElementById('formattedCode');
+    codeEl.textContent = '';
+    codeEl.appendChild(buildXmlFragment(xml));
+}
+
+function buildXmlFragment(xml) {
+    const fragment = document.createDocumentFragment();
+    const tokenRegex = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<\/?[\w:-]+(?:\s+[\w:-]+(?:="[^"]*")?)*\s*\/?>/g;
+    let lastIndex = 0;
+    let match;
+    while ((match = tokenRegex.exec(xml))) {
+        if (match.index > lastIndex) fragment.appendChild(document.createTextNode(xml.slice(lastIndex, match.index)));
+        appendXmlToken(fragment, match[0]);
+        lastIndex = tokenRegex.lastIndex;
+    }
+    if (lastIndex < xml.length) fragment.appendChild(document.createTextNode(xml.slice(lastIndex)));
+    return fragment;
+}
+
+function appendXmlToken(fragment, token) {
+    if (token.startsWith('<!--')) {
+        appendXmlSpan(fragment, 'xml-comment', token);
+        return;
+    }
+    if (token.startsWith('<![CDATA[')) {
+        appendXmlSpan(fragment, 'xml-cdata', token);
+        return;
+    }
+    if (token.startsWith('<?')) {
+        fragment.appendChild(document.createTextNode('<?'));
+        const body = token.slice(2, -2).trim();
+        const firstSpace = body.search(/\s/);
+        const name = firstSpace === -1 ? body : body.slice(0, firstSpace);
+        appendXmlSpan(fragment, 'xml-tag', name);
+        if (firstSpace !== -1) fragment.appendChild(document.createTextNode(body.slice(firstSpace)));
+        fragment.appendChild(document.createTextNode('?>'));
+        return;
+    }
+
+    const isClosing = token.startsWith('</');
+    const isSelfClosing = token.endsWith('/>');
+    const inner = token.slice(isClosing ? 2 : 1, token.length - (isSelfClosing ? 2 : 1));
+    const nameMatch = inner.match(/^([\w:-]+)/);
+    const tagName = nameMatch ? nameMatch[1] : inner.trim();
+    const attrText = nameMatch ? inner.slice(tagName.length) : '';
+
+    fragment.appendChild(document.createTextNode(isClosing ? '</' : '<'));
+    appendXmlSpan(fragment, 'xml-tag', tagName);
+    appendXmlAttributes(fragment, attrText);
+    fragment.appendChild(document.createTextNode(isSelfClosing ? '/>' : '>'));
+}
+
+function appendXmlAttributes(fragment, attrText) {
+    let lastIndex = 0;
+    const attrRegex = /([\w:-]+)(=)("[^"]*")/g;
+    let match;
+    while ((match = attrRegex.exec(attrText))) {
+        if (match.index > lastIndex) fragment.appendChild(document.createTextNode(attrText.slice(lastIndex, match.index)));
+        appendXmlSpan(fragment, 'xml-attr', match[1]);
+        fragment.appendChild(document.createTextNode(match[2]));
+        appendXmlSpan(fragment, 'xml-value', match[3]);
+        lastIndex = attrRegex.lastIndex;
+    }
+    if (lastIndex < attrText.length) fragment.appendChild(document.createTextNode(attrText.slice(lastIndex)));
+}
+
+function appendXmlSpan(fragment, className, text) {
+    const span = document.createElement('span');
+    span.className = className;
+    span.textContent = text;
+    fragment.appendChild(span);
 }
 
 function showXmlError(raw, errMsg) {
     const panel = document.getElementById('errorPanel');
     const msgEl = document.getElementById('errorMessage');
+    document.getElementById('errorTitle').textContent = 'XML 解析提示';
     panel.classList.remove('hidden');
     document.getElementById('fixSuggestion').classList.add('hidden');
-    msgEl.innerHTML = `<div style="color:var(--danger);font-weight:600;">❌ XML 解析错误</div><div style="margin-top:8px;">${escapeHtml(errMsg)}</div>`;
+    msgEl.innerHTML = `<div class="error-summary">❌ XML 语法存在问题</div><div class="error-hint">${escapeHtml(errMsg)}</div>`;
 }
 
 // ===== Java toString() 格式处理 =====
@@ -614,15 +853,16 @@ function doFormat() {
     const type = detectType(raw);
     if (type === 'json') {
         try {
-            const obj = JSON.parse(raw);
-            inputArea.value = JSON.stringify(obj, null, 2);
+            inputArea.value = formatStructuredJson(raw).text;
             onInputChange();
             showToast('✓ JSON 格式化完成');
         } catch (e) { processJson(raw); }
     } else if (type === 'xml') {
-        inputArea.value = formatXml(raw);
-        onInputChange();
-        showToast('✓ XML 格式化完成');
+        try {
+            inputArea.value = formatXml(raw);
+            onInputChange();
+            showToast('✓ XML 格式化完成');
+        } catch (e) { showXmlError(raw, e.message); }
     } else if (type === 'tostring') {
         // 将 Java toString 格式转换为格式化的 JSON
         try {
@@ -640,14 +880,16 @@ function doMinify() {
     const type = detectType(raw);
     if (type === 'json') {
         try {
-            inputArea.value = JSON.stringify(JSON.parse(raw));
+            inputArea.value = formatStructuredJson(raw, 0).text;
             onInputChange();
             showToast('✓ JSON 已压缩');
         } catch (e) { processJson(raw); }
     } else if (type === 'xml') {
-        inputArea.value = raw.replace(/>\s+</g, '><').replace(/\s+/g, ' ').trim();
-        onInputChange();
-        showToast('✓ XML 已压缩');
+        try {
+            inputArea.value = minifyXml(raw);
+            onInputChange();
+            showToast('✓ XML 已压缩');
+        } catch (e) { showXmlError(raw, e.message); }
     } else if (type === 'tostring') {
         try {
             const obj = parseJavaToString(raw);
@@ -712,6 +954,8 @@ function clearOutput() {
     document.getElementById('jsonTree').innerHTML = '';
     document.getElementById('dataType').textContent = '未检测';
     currentData = null; currentType = null;
+    clearSearch();
+    closeErrorPanel();
     updateStats();
     updateLineNumbers();
 }
@@ -771,6 +1015,60 @@ function toggleTheme() {
     }
 })();
 
+// ===== 左右面板拖拽 =====
+function initPanelResize() {
+    if (!panelDivider || !mainContent || !inputPanel || !outputPanel) {
+        console.warn('面板拖拽初始化失败：缺少必要的 DOM 节点');
+        return;
+    }
+    panelDivider.addEventListener('pointerdown', startPanelResize);
+    panelDivider.addEventListener('dblclick', resetPanelWidth);
+    window.addEventListener('resize', clampPanelWidth);
+}
+
+function startPanelResize(e) {
+    e.preventDefault();
+    const rect = mainContent.getBoundingClientRect();
+    const maxWidth = rect.width - PANEL_MIN_WIDTH;
+    mainContent.classList.add('resizing');
+    document.body.classList.add('is-resizing');
+
+    const onMove = event => {
+        const targetWidth = event.clientX - rect.left;
+        const nextWidth = Math.min(maxWidth, Math.max(PANEL_MIN_WIDTH, targetWidth));
+        inputPanel.style.flex = `0 0 ${nextWidth}px`;
+        outputPanel.style.flex = '1 1 0';
+    };
+
+    const stop = () => {
+        mainContent.classList.remove('resizing');
+        document.body.classList.remove('is-resizing');
+        window.removeEventListener('pointermove', onMove);
+        window.removeEventListener('pointerup', stop);
+    };
+
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', stop, { once: true });
+}
+
+function resetPanelWidth() {
+    inputPanel.style.flex = '0 0 50%';
+    outputPanel.style.flex = '1 1 0';
+}
+
+function clampPanelWidth() {
+    if (!inputPanel.style.flexBasis) return;
+    const rect = mainContent.getBoundingClientRect();
+    const basis = inputPanel.style.flexBasis;
+    const current = basis.endsWith('%')
+        ? rect.width * parseFloat(basis) / 100
+        : parseFloat(basis);
+    if (!Number.isFinite(current)) return;
+    const maxWidth = rect.width - PANEL_MIN_WIDTH;
+    const clamped = Math.min(maxWidth, Math.max(PANEL_MIN_WIDTH, current));
+    inputPanel.style.flex = `0 0 ${clamped}px`;
+}
+
 // ===== 树形视图搜索 =====
 let searchMatches = [];   // 匹配到的 DOM 元素列表
 let searchIndex = -1;     // 当前高亮的索引
@@ -787,14 +1085,15 @@ function onSearchInput() {
         return;
     }
 
-    // 在树形视图中查找所有匹配的 key 节点
-    const allKeys = document.querySelectorAll('#jsonTree .tree-key');
+    // 在树形视图中查找所有匹配的 key / value 节点
+    const allNodes = document.querySelectorAll('#jsonTree .tree-key, #jsonTree .tree-value');
     searchMatches = [];
 
-    allKeys.forEach(el => {
+    allNodes.forEach(el => {
         const text = el.textContent.replace(/"/g, '').replace(/:\s*$/, '').toLowerCase();
         if (text.includes(keyword)) {
-            el.classList.add('search-highlight');
+            const searchType = getSearchType(el);
+            el.classList.add(searchType === 'value' ? 'search-highlight-value' : 'search-highlight');
             searchMatches.push(el);
             // 自动展开所有父级折叠节点
             expandParents(el);
@@ -805,8 +1104,7 @@ function onSearchInput() {
     const countEl = document.getElementById('searchCount');
     if (searchMatches.length > 0) {
         searchIndex = 0;
-        searchMatches[0].classList.add('active');
-        searchMatches[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+        activateSearchMatch(searchIndex);
         updateSearchInfo();
     } else {
         searchIndex = -1;
@@ -817,27 +1115,46 @@ function onSearchInput() {
 
 function searchNext() {
     if (searchMatches.length === 0) return;
-    searchMatches[searchIndex].classList.remove('active');
     searchIndex = (searchIndex + 1) % searchMatches.length;
-    searchMatches[searchIndex].classList.add('active');
-    searchMatches[searchIndex].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    activateSearchMatch(searchIndex);
     updateSearchInfo();
 }
 
 function searchPrev() {
     if (searchMatches.length === 0) return;
-    searchMatches[searchIndex].classList.remove('active');
     searchIndex = (searchIndex - 1 + searchMatches.length) % searchMatches.length;
-    searchMatches[searchIndex].classList.add('active');
-    searchMatches[searchIndex].scrollIntoView({ behavior: 'smooth', block: 'center' });
+    activateSearchMatch(searchIndex);
     updateSearchInfo();
+}
+
+function activateSearchMatch(index) {
+    searchMatches.forEach(el => {
+        el.classList.remove('active');
+        el.closest('.tree-line')?.classList.remove('active-match');
+    });
+    const target = searchMatches[index];
+    if (!target) return;
+    target.classList.add('active');
+    target.closest('.tree-line')?.classList.add('active-match');
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
 // 更新搜索计数和路径显示
 function updateSearchInfo() {
+    const active = searchMatches[searchIndex];
+    if (!active) {
+        document.getElementById('searchCount').textContent = searchMatches.length ? `0/${searchMatches.length}` : '';
+        document.getElementById('searchPath').textContent = '';
+        return;
+    }
     document.getElementById('searchCount').textContent = `${searchIndex + 1}/${searchMatches.length}`;
-    const path = searchMatches[searchIndex].dataset.path || '';
-    document.getElementById('searchPath').textContent = path;
+    const path = active.dataset.path || '';
+    const label = getSearchType(active) === 'value' ? '值' : '字段';
+    document.getElementById('searchPath').textContent = path ? `${label}：${path}` : '';
+}
+
+function getSearchType(el) {
+    return el?.dataset.searchType === 'value' ? 'value' : 'key';
 }
 
 function clearSearch() {
@@ -850,8 +1167,9 @@ function clearSearch() {
 }
 
 function clearSearchHighlights() {
-    document.querySelectorAll('#jsonTree .search-highlight').forEach(el => {
-        el.classList.remove('search-highlight', 'active');
+    document.querySelectorAll('#jsonTree .search-highlight, #jsonTree .search-highlight-value').forEach(el => {
+        el.classList.remove('search-highlight', 'search-highlight-value', 'active');
+        el.closest('.tree-line')?.classList.remove('active-match');
     });
 }
 
