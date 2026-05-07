@@ -213,17 +213,53 @@ body {
     display: flex;
     flex: 1;
     overflow: hidden;
+    position: relative;
 }
 
 .panel {
-    flex: 1;
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    min-width: 280px;
 }
 
 .input-panel {
+    flex: 0 0 50%;
     border-right: 1px solid var(--border);
+}
+
+.output-panel {
+    flex: 1 1 0;
+}
+
+.panel-divider {
+    position: relative;
+    flex: 0 0 10px;
+    cursor: col-resize;
+    background: transparent;
+}
+
+.panel-divider::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 2px;
+    transform: translateX(-50%);
+    background: var(--border);
+    transition: background var(--transition), box-shadow var(--transition);
+}
+
+.panel-divider:hover::before,
+.main-content.resizing .panel-divider::before {
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-glow);
+}
+
+body.is-resizing {
+    cursor: col-resize;
+    user-select: none;
 }
 
 .panel-header {
@@ -367,6 +403,15 @@ body {
     color: var(--xml-value);
 }
 
+.xml-comment {
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+.xml-cdata {
+    color: var(--warning);
+}
+
 /* ===== 树形视图 ===== */
 .tree-node {
     position: relative;
@@ -389,6 +434,11 @@ body {
 
 .tree-line:hover {
     background: var(--bg-hover);
+}
+
+.tree-line.active-match {
+    background: rgba(88, 166, 255, 0.14);
+    box-shadow: inset 0 0 0 1px rgba(88, 166, 255, 0.22);
 }
 
 .tree-toggle {
@@ -556,32 +606,48 @@ body {
     outline: 1px solid var(--warning);
 }
 
+.search-highlight-value {
+    background: rgba(88, 166, 255, 0.16);
+    border-radius: 2px;
+    outline: 1px solid var(--accent);
+}
+
 .search-highlight.active {
     background: rgba(210, 153, 34, 0.6);
     outline: 2px solid var(--warning);
 }
 
+.search-highlight-value.active {
+    background: rgba(88, 166, 255, 0.28);
+    outline-color: var(--accent);
+}
+
 /* ===== 错误面板 ===== */
 .error-panel {
     position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
+    right: 20px;
+    bottom: 20px;
+    left: auto;
+    width: min(560px, calc(100vw - 40px));
     background: var(--bg-secondary);
-    border-top: 2px solid var(--danger);
-    box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.5);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--danger);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow);
     z-index: 100;
-    max-height: 50vh;
+    max-height: min(44vh, 420px);
     overflow-y: auto;
-    animation: slideUp 0.3s ease;
+    animation: fadeInUp 0.2s ease;
 }
 
-@keyframes slideUp {
+@keyframes fadeInUp {
     from {
-        transform: translateY(100%);
+        opacity: 0;
+        transform: translateY(12px);
     }
 
     to {
+        opacity: 1;
         transform: translateY(0);
     }
 }
@@ -594,12 +660,9 @@ body {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 10px 20px;
+    padding: 10px 14px;
     border-bottom: 1px solid var(--border);
-    position: sticky;
-    top: 0;
     background: var(--bg-secondary);
-    z-index: 1;
 }
 
 .error-title {
@@ -628,15 +691,17 @@ body {
 }
 
 .error-body {
-    padding: 16px 20px;
+    padding: 12px 14px 14px;
 }
 
 .error-msg {
     font-family: var(--font-mono);
     font-size: 13px;
-    line-height: 1.8;
+    line-height: 1.6;
     color: var(--text-primary);
-    white-space: pre-wrap;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
 }
 
 .error-msg .error-line-num {
@@ -649,8 +714,42 @@ body {
     font-weight: 700;
 }
 
+.error-summary {
+    color: var(--danger);
+    font-weight: 600;
+}
+
+.error-hint {
+    color: var(--text-secondary);
+}
+
+.error-context {
+    margin-top: 6px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-primary);
+    overflow-x: auto;
+}
+
+.error-details {
+    border-top: 1px dashed var(--border);
+    padding-top: 10px;
+}
+
+.error-detail-toggle {
+    color: var(--accent);
+    cursor: pointer;
+    list-style: none;
+    font-weight: 500;
+}
+
+.error-detail-toggle::-webkit-details-marker {
+    display: none;
+}
+
 .fix-suggestion {
-    margin-top: 16px;
+    margin-top: 4px;
     border: 1px solid rgba(63, 185, 80, 0.3);
     border-radius: var(--radius);
     overflow: hidden;
