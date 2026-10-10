@@ -79,7 +79,7 @@ document.getElementById('fileInput').addEventListener('change', event => {
 });
 function getDownloadPayload() {
     let text = document.getElementById('formattedCode').textContent;
-    if (!text || currentData === null) return null;
+    if (!text) return null;
     const xml = currentType === 'xml';
     if (xml) text = text.replace(/^(<\?xml\b[^?]*?\bencoding\s*=\s*)(["'])[^"']*\2/i, '$1"UTF-8"');
     const basename = importedName ? importedName.replace(/\.[^.]*$/, '').replace(/[\\/:*?"<>|]/g, '_') : 'formatted';

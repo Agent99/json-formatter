@@ -239,6 +239,11 @@ document.querySelector('iframe').onload = async () => {
         const value = app.parseLosslessJson(input.value); equal(value.code, '00123');
         equal(app.stringifyLosslessJson(value.id), '9223372036854775807');
     });
+    check('all valid JSON root types can be downloaded', () => {
+        for (const raw of ['null','false','""','[]','{}','9223372036854775807']) {
+            app.replaceEditorText(raw); equal(app.getDownloadPayload().text, raw);
+        }
+    });
     document.getElementById('results').textContent = results.join('\n');
     document.body.dataset.status = results.some(line => line.startsWith('FAIL')) ? 'failed' : 'passed';
 };
