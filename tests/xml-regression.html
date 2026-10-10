@@ -1,0 +1,95 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Formatter regression tests</title>
+<pre id="results">Running…</pre>
+<iframe src="../index.html" hidden></iframe>
+<script>
+document.querySelector('iframe').onload = () => {
+    const app = document.querySelector('iframe').contentWindow;
+    app.HTMLElement.prototype.scrollIntoView = function () {};
+    const results = [];
+    const check = (name, fn) => {
+        try { fn(); results.push('PASS ' + name); }
+        catch (error) { results.push('FAIL ' + name + ': ' + error.message); }
+    };
+    const equal = (a, b) => { if (a !== b) throw Error(JSON.stringify(a) + ' !== ' + JSON.stringify(b)); };
+    const cases = [
+        '<p>Hello <b> world </b> !</p>',
+        '<p><b/> <i/> tail</p>',
+        '<r><x>  a   b  </x></r>',
+        '<r xml:space="preserve"> \n <x/> \n </r>',
+        '<r xml:space="preserve"><x xml:space="default"> a </x> </r>',
+        '<r><![CDATA[a\n\n\nb <c>]]></r>',
+        `<?xml version="1.0"?><!DOCTYPE r PUBLIC "abc" "urn:test" [<!ENTITY foo "hello">]><r>&foo;</r>`,
+        `<!DOCTYPE r [<!-- [ ] > --><!ENTITY foo "a > b">]><r>&foo;</r>`,
+        `<根 属性 = 'a > b'><子/> <!--x--> </根>`,
+        '<r xmlns="urn:a" xmlns:n="urn:b"><n:x id="1"/><n:x id="2"/></r>',
+        '<r><parsererror>legitimate</parsererror></r>',
+        '<?xml version="1.0"?><?test x?><r><!--x--><empty></empty></r>',
+        '<r><x> &#32; </x><x a="&#10;&#9;&#13;"/></r>'
+    ];
+    cases.forEach((xml, i) => check('XML round trip ' + i, () => {
+        const pretty = app.formatXml(xml);
+        const mini = app.minifyXml(pretty);
+        app.parseXmlDocument(pretty);
+        app.parseXmlDocument(mini);
+        equal(app.formatXml(pretty), pretty);
+        equal(app.minifyXml(mini), mini);
+        if (i < 2 || i === 3 || i === 4 || i === 5) equal(pretty, xml);
+        if (i === 2 && !pretty.includes('  a   b  ')) throw Error('text spaces changed');
+        if (i === 6 && !mini.includes('<!DOCTYPE r PUBLIC "abc" "urn:test" [<!ENTITY foo "hello">]>')) throw Error('DTD changed');
+    }));
+    check('compression removes element-only indentation', () => equal(app.minifyXml('<r>\n  <x/>\n</r>'), '<r><x/></r>'));
+    check('invalid XML rejected', () => {
+        let rejected = false;
+        try { app.formatXml('<r><x></r>'); } catch { rejected = true; }
+        if (!rejected) throw Error('accepted malformed XML');
+    });
+    const input = app.document.getElementById('inputArea');
+    check('XML sample, search, paths and namespace-aware copying', () => {
+        app.document.getElementById('sampleType').value = 'xml';
+        app.loadSample();
+        equal(app.document.getElementById('sortKeysButton').disabled, true);
+        const search = app.document.getElementById('searchInput');
+        search.value = '002'; app.onSearchInput();
+        equal(app.document.getElementById('searchCount').textContent, '1/1');
+        equal(app.document.getElementById('searchPath').textContent, '值：/orders[1]/order[2]/@id');
+        app.doCollapseAll(); search.value = '轻放'; app.onSearchInput();
+        equal(app.document.getElementById('searchCount').textContent, '1/1');
+        const active = app.document.querySelector('#jsonTree .tree-value.active');
+        if (active.closest('.tree-children').classList.contains('collapsed')) throw Error('search did not expand parents');
+        search.value = ''; app.onSearchInput(); equal(app.document.getElementById('searchPath').textContent, '');
+        let copied = '';
+        const original = app.copyToClipboard;
+        app.copyToClipboard = text => { copied = text; };
+        const amount = Array.from(app.document.querySelectorAll('.xml-tree-node')).find(node => node.firstElementChild.textContent.includes('<pay:amount>'));
+        amount.firstElementChild.querySelector('.tree-copy-btn').click();
+        app.copyToClipboard = original;
+        const doc = app.parseXmlDocument(copied);
+        equal(doc.documentElement.namespaceURI, 'urn:payment');
+    });
+    check('invalid XML clears previous output', () => {
+        input.value = '<r><bad></r>'; app.onInputChange();
+        equal(app.document.getElementById('formattedCode').textContent, '');
+        equal(app.document.getElementById('jsonTree').textContent, '');
+    });
+    check('JSON highlighting, escaping and paths', () => {
+        input.value = '{"<img src=x onerror=alert(1)>":"a&b","list":[1,true,null],"1":"numeric key"}';
+        app.onInputChange();
+        const code = app.document.getElementById('formattedCode');
+        equal(code.textContent, JSON.stringify(JSON.parse(input.value), null, 2));
+        equal(code.querySelector('img'), null);
+        if (!code.querySelector('.json-key') || !code.querySelector('.json-string')) throw Error('highlighting missing');
+        const paths = Array.from(app.document.querySelectorAll('.tree-key')).map(el => el.dataset.path);
+        if (!paths.includes('$["list"][0]') || !paths.includes('$["1"]')) throw Error('invalid JSON paths');
+        equal(app.document.getElementById('sortKeysButton').disabled, false);
+    });
+    check('invalid JSON clears previous output', () => {
+        input.value = '{'; app.onInputChange();
+        equal(app.document.getElementById('formattedCode').textContent, '');
+        equal(app.document.getElementById('jsonTree').textContent, '');
+    });
+    document.getElementById('results').textContent = results.join('\n');
+    document.body.dataset.status = results.some(line => line.startsWith('FAIL')) ? 'failed' : 'passed';
+};
+</script>

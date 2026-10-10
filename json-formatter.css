@@ -863,3 +863,9 @@ body.is-resizing {
 ::-webkit-scrollbar-thumb:hover {
     background: var(--border-light);
 }
+
+/* XML 树沿用搜索、折叠交互；长文本可换行。 */
+.xml-tree-node .tree-value { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
+button.tree-toggle { border: 0; background: transparent; font: inherit; }
+.btn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
