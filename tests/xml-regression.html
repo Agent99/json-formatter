@@ -1,0 +1,250 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>JSON / XML Formatter regression tests</title>
+<pre id="results">Running…</pre>
+<iframe src="../index.html" style="position:absolute;left:-2000px;width:1440px;height:1000px"></iframe>
+<script>
+document.querySelector('iframe').onload = async () => {
+    const app = document.querySelector('iframe').contentWindow;
+    app.HTMLElement.prototype.scrollIntoView = function () {};
+    const results = [];
+    const check = (name, fn) => {
+        try { fn(); results.push('PASS ' + name); }
+        catch (error) { results.push('FAIL ' + name + ': ' + error.message); }
+    };
+    const checkAsync = async (name, fn) => {
+        try { await fn(); results.push('PASS ' + name); }
+        catch (error) { results.push('FAIL ' + name + ': ' + error.message); }
+    };
+    const waitUntil = async predicate => {
+        const start = Date.now();
+        while (!predicate()) {
+            if (Date.now() - start > 10000) throw Error('timeout');
+            await new Promise(resolve => setTimeout(resolve, 20));
+        }
+    };
+    const equal = (a, b) => { if (a !== b) throw Error(JSON.stringify(a) + ' !== ' + JSON.stringify(b)); };
+    const cases = [
+        '<p>Hello <b> world </b> !</p>',
+        '<p><b/> <i/> tail</p>',
+        '<r><x>  a   b  </x></r>',
+        '<r xml:space="preserve"> \n <x/> \n </r>',
+        '<r xml:space="preserve"><x xml:space="default"> a </x> </r>',
+        '<r><![CDATA[a\n\n\nb <c>]]></r>',
+        `<?xml version="1.0"?><!DOCTYPE r PUBLIC "abc" "urn:test" [<!ENTITY foo "hello">]><r>&foo;</r>`,
+        `<!DOCTYPE r [<!-- [ ] > --><!ENTITY foo "a > b">]><r>&foo;</r>`,
+        `<根 属性 = 'a > b'><子/> <!--x--> </根>`,
+        '<r xmlns="urn:a" xmlns:n="urn:b"><n:x id="1"/><n:x id="2"/></r>',
+        '<r><parsererror>legitimate</parsererror></r>',
+        '<?xml version="1.0"?><?test x?><r><!--x--><empty></empty></r>',
+        '<r><x> &#32; </x><x a="&#10;&#9;&#13;"/></r>'
+    ];
+    cases.forEach((xml, i) => check('XML round trip ' + i, () => {
+        const pretty = app.formatXml(xml);
+        const mini = app.minifyXml(pretty);
+        app.parseXmlDocument(pretty);
+        app.parseXmlDocument(mini);
+        equal(app.formatXml(pretty), pretty);
+        equal(app.minifyXml(mini), mini);
+        if (i < 2 || i === 3 || i === 4 || i === 5) equal(pretty, xml);
+        if (i === 2 && !pretty.includes('  a   b  ')) throw Error('text spaces changed');
+        if (i === 6 && !mini.includes('<!DOCTYPE r PUBLIC "abc" "urn:test" [<!ENTITY foo "hello">]>')) throw Error('DTD changed');
+    }));
+    check('compression removes element-only indentation', () => equal(app.minifyXml('<r>\n  <x/>\n</r>'), '<r><x/></r>'));
+    check('invalid XML rejected', () => {
+        let rejected = false;
+        try { app.formatXml('<r><x></r>'); } catch { rejected = true; }
+        if (!rejected) throw Error('accepted malformed XML');
+    });
+    const input = app.document.getElementById('inputArea');
+    check('XML sample, search, paths and namespace-aware copying', () => {
+        app.document.getElementById('sampleType').value = 'xml';
+        app.loadSample();
+        equal(app.document.getElementById('sortKeysButton').disabled, true);
+        const search = app.document.getElementById('searchInput');
+        search.value = '002'; app.onSearchInput();
+        equal(app.document.getElementById('searchCount').textContent, '1/1');
+        equal(app.document.getElementById('searchPath').textContent, '值：/orders[1]/order[2]/@id');
+        app.doCollapseAll(); search.value = '轻放'; app.onSearchInput();
+        equal(app.document.getElementById('searchCount').textContent, '1/1');
+        const active = app.document.querySelector('#jsonTree .tree-value.active');
+        if (active.closest('.tree-children').classList.contains('collapsed')) throw Error('search did not expand parents');
+        search.value = ''; app.onSearchInput(); equal(app.document.getElementById('searchPath').textContent, '');
+        let copied = '';
+        const original = app.copyToClipboard;
+        app.copyToClipboard = text => { copied = text; };
+        const amount = Array.from(app.document.querySelectorAll('.xml-tree-node')).find(node => node.firstElementChild.textContent.includes('<pay:amount>'));
+        amount.firstElementChild.querySelector('.tree-copy-btn').click();
+        app.copyToClipboard = original;
+        const doc = app.parseXmlDocument(copied);
+        equal(doc.documentElement.namespaceURI, 'urn:payment');
+    });
+    check('invalid XML clears previous output', () => {
+        input.value = '<r><bad></r>'; app.onInputChange();
+        equal(app.document.getElementById('formattedCode').textContent, '');
+        equal(app.document.getElementById('jsonTree').textContent, '');
+    });
+    check('JSON highlighting, escaping and paths', () => {
+        input.value = '{"<img src=x onerror=alert(1)>":"a&b","list":[1,true,null],"1":"numeric key"}';
+        app.onInputChange();
+        const code = app.document.getElementById('formattedCode');
+        equal(code.textContent, JSON.stringify(JSON.parse(input.value), null, 2));
+        equal(code.querySelector('img'), null);
+        if (!code.querySelector('.json-key') || !code.querySelector('.json-string')) throw Error('highlighting missing');
+        const paths = Array.from(app.document.querySelectorAll('.tree-key')).map(el => el.dataset.path);
+        if (!paths.includes('$["list"][0]') || !paths.includes('$["1"]')) throw Error('invalid JSON paths');
+        equal(app.document.getElementById('sortKeysButton').disabled, false);
+    });
+    check('invalid JSON clears previous output', () => {
+        input.value = '{'; app.onInputChange();
+        equal(app.document.getElementById('formattedCode').textContent, '');
+        equal(app.document.getElementById('jsonTree').textContent, '');
+    });
+    check('lossless numbers across format, minify, sort and copy', () => {
+        const raw = '{"z":9223372036854775807,"a":-9223372036854775808,"decimal":0.123456789012345678901,"exponent":1e400,"negativeZero":-0}';
+        equal(app.formatStructuredJson(raw, 0).text, raw);
+        input.value = raw; app.onInputChange(); app.doSortKeys();
+        if (!input.value.includes('9223372036854775807') || !input.value.includes('1e400')) throw Error('number changed during sort');
+        let copied;
+        const original = app.copyToClipboard; app.copyToClipboard = text => copied = text;
+        const line = Array.from(app.document.querySelectorAll('.tree-line')).find(row => row.textContent.includes('"z":'));
+        line.querySelector('.tree-copy-btn').click(); app.copyToClipboard = original;
+        equal(copied, '9223372036854775807');
+        equal(app.formatStructuredJson('"{\\"id\\":9223372036854775807}"', 0).text, '{"id":9223372036854775807}');
+    });
+    check('prototype-like keys remain ordinary data', () => {
+        const raw = '{"__proto__":{"polluted":true},"constructor":1}';
+        equal(app.stringifyLosslessJson(app.sortObjectKeys(app.parseLosslessJson(raw))), raw);
+        input.value = '{__proto__=1, id=9223372036854775807}'; app.doFormat();
+        if (!input.value.includes('9223372036854775807')) throw Error('Java ID changed');
+    });
+    check('repair preserves string contents and large numbers', () => {
+        const raw = `{url:'https://example.com/a//b', text:'}, ] /* literal */', quote:'it\\'s "ok"', id:9223372036854775807, // real comment
+        nested:[1 2 3,], missing:{a:true`;
+        const fixed = app.tryAutoFix(raw);
+        if (!fixed) throw Error('no repair');
+        const value = app.parseLosslessJson(fixed.result);
+        equal(value.url, 'https://example.com/a//b');
+        equal(value.text, '}, ] /* literal */');
+        equal(value.quote, `it's "ok"`);
+        equal(app.stringifyLosslessJson(value.id), '9223372036854775807');
+        equal(app.stringifyLosslessJson(value.nested), '[1,2,3]');
+    });
+    check('repair declines ambiguous or already valid input', () => {
+        equal(app.tryAutoFix(JSON.stringify({text:'http://a/*b*/',brackets:'{[}',quote:"it's"})), null);
+        equal(app.tryAutoFix('{"a":"unterminated}'), null);
+        equal(app.tryAutoFix('{"a":undefined}'), null);
+        equal(app.tryAutoFix('{"a":[1}'), null);
+    });
+    check('native and lossless parsers agree on ordinary JSON', () => {
+        for (let i = 0; i < 200; i++) {
+            const raw = JSON.stringify({text:'value\\"' + i, a:[i, i / 3, null, i % 2 === 0, {key:'http://a//b'}]});
+            equal(app.stringifyLosslessJson(app.parseLosslessJson(raw)), raw);
+        }
+        for (const raw of ['[1,]', '{"a":1,}', '01', '-01', '1.', '1e', '[true false]', '{"a" 1}', '{"a":NaN}', 'truex', '{"a":"bad\\q"}']) {
+            let rejected = false; try { app.parseLosslessJson(raw); } catch { rejected = true; }
+            if (!rejected) throw Error('accepted ' + raw);
+        }
+    });
+    check('legitimate XHTML parsererror element is not an error', () => {
+        app.parseXmlDocument('<r xmlns="http://www.w3.org/1999/xhtml"><parsererror>user content</parsererror></r>');
+    });
+    check('toolbar changes support undo and redo', () => {
+        const raw = '{"id":9223372036854775807,"a":[1,2]}';
+        app.replaceEditorText(raw); app.doFormat(); const formatted = input.value;
+        app.doUndo(); equal(input.value, raw);
+        app.doRedo(); equal(input.value, formatted);
+        app.doClear(); equal(input.value, ''); app.doUndo(); equal(input.value, formatted);
+        app.doUndo(); app.replaceEditorText('{"new":true}'); app.doRedo(); equal(input.value, '{"new":true}');
+    });
+    check('download uses the correct extension and preserves numbers', () => {
+        app.replaceEditorText('{"id":9223372036854775807}');
+        let payload = app.getDownloadPayload(); equal(payload.name, 'formatted.json');
+        if (!payload.text.includes('9223372036854775807')) throw Error('download changed ID');
+        app.replaceEditorText('<?xml version="1.0" encoding="GBK"?><r>你好</r>');
+        payload = app.getDownloadPayload(); equal(payload.name, 'formatted.xml');
+        if (!payload.text.includes('encoding="UTF-8"')) throw Error('wrong encoding declaration');
+        app.replaceEditorText('{'); equal(app.getDownloadPayload(), null);
+    });
+    const large = '[' + Array.from({length:5000}, (_, i) => '{"id":9223372036854775807,"name":"item-' + i + '","padding":"abcdefghijklmnopqrstuvwxyz0123456789"}').join(',') + ']';
+    await checkAsync('large JSON virtual tree and full-data search', async () => {
+        input.value = large; app.onInputChange();
+        await waitUntil(() => app.document.getElementById('formattedCode').textContent.includes('item-4999'));
+        const tree = app.document.getElementById('jsonTree');
+        if (!app.document.getElementById('treeOutput').classList.contains('virtual-mode')) throw Error('tree not virtualized');
+        app.doExpandAll();
+        if (tree.querySelectorAll('.tree-line').length > 100) throw Error('too many mounted rows');
+        app.doCollapseAll();
+        const search = app.document.getElementById('searchInput'); search.value = 'item-4999'; app.onSearchInput();
+        equal(app.document.getElementById('searchCount').textContent, '1/1');
+        equal(app.document.getElementById('searchPath').textContent, '值：$[4999]["name"]');
+        if (!tree.querySelector('.tree-value.active')) throw Error('match not mounted');
+        search.value = '9223372036854775807'; app.onSearchInput();
+        equal(app.document.getElementById('searchCount').textContent, '1/5000');
+        app.searchPrev(); equal(app.document.getElementById('searchCount').textContent, '5000/5000');
+        let copied; const original = app.copyToClipboard; app.copyToClipboard = text => copied = text;
+        tree.querySelector('.active-match .tree-copy-btn').click(); app.copyToClipboard = original;
+        equal(copied, '9223372036854775807');
+    });
+    await checkAsync('large JSON background compression preserves numbers', async () => {
+        await app.doMinify();
+        await waitUntil(() => app.document.getElementById('formattedCode').textContent.includes('item-4999'));
+        equal(input.value, large);
+    });
+    await checkAsync('outdated background results are cancelled', async () => {
+        input.value = large; app.onInputChange();
+        input.value = '{"latest":true}'; input.dispatchEvent(new app.Event('input')); app.onInputChange();
+        await new Promise(resolve => setTimeout(resolve, 100));
+        equal(app.document.getElementById('formattedCode').textContent, '{\n  "latest": true\n}');
+    });
+    check('large XML virtual tree searches unmounted nodes', () => {
+        input.value = '<r xmlns:n="urn:test">' + Array.from({length:1200}, (_, i) => '<n:x id="' + i + '"><name>xml-' + i + '</name></n:x>').join('') + '</r>';
+        app.onInputChange(); app.doExpandAll();
+        const tree = app.document.getElementById('jsonTree');
+        if (tree.querySelectorAll('.tree-line').length > 100) throw Error('too many XML rows');
+        app.doCollapseAll(); app.document.getElementById('searchInput').value = 'xml-1199'; app.onSearchInput();
+        equal(app.document.getElementById('searchCount').textContent, '1/1');
+        equal(app.document.getElementById('searchPath').textContent, '值：/r[1]/n:x[1200]/name[1]/text()[1]');
+    });
+    check('line-number DOM is bounded', () => {
+        input.value = '[\n' + Array.from({length:5000}, () => '1').join(',\n') + '\n]'; app.onInputChange();
+        if (app.document.getElementById('lineNumbers').children.length > 100) throw Error('too many line numbers');
+    });
+    await checkAsync('UTF-8 import is undoable and oversize files are rejected', async () => {
+        app.replaceEditorText('{"before":true}');
+        const file = new app.File(['\uFEFF{"id":9223372036854775807}'], 'example.json', {type:'application/json'});
+        equal(await app.doImportFile(file), true); equal(input.value, '{"id":9223372036854775807}');
+        equal(app.getDownloadPayload().name, 'example.json');
+        app.doUndo(); equal(input.value, '{"before":true}');
+        equal(await app.doImportFile({size:11 * 1024 * 1024}), false); equal(input.value, '{"before":true}');
+    });
+    await checkAsync('file reads cannot overwrite subsequent edits', async () => {
+        let finish;
+        const pending = app.doImportFile({name:'slow.json',size:2,text:() => new Promise(resolve => finish = resolve)});
+        app.replaceEditorText('{"edited":true}'); finish('{}');
+        equal(await pending, false); equal(input.value, '{"edited":true}');
+    });
+    check('long values use a bounded preview with full copying', () => {
+        const long = 'x'.repeat(12000); app.replaceEditorText(JSON.stringify({long}));
+        const tree = app.document.getElementById('jsonTree');
+        if (!app.document.getElementById('treeOutput').classList.contains('virtual-mode')) throw Error('long value not virtualized');
+        const value = tree.querySelector('.tree-value.json-string');
+        if (value.textContent.length > 501 || value.title.length > 600) throw Error('preview unbounded');
+        let copied; const original = app.copyToClipboard; app.copyToClipboard = text => copied = text;
+        value.parentElement.querySelector('.tree-copy-btn').click(); app.copyToClipboard = original;
+        equal(copied, long);
+    });
+    check('Java leading zeros remain strings', () => {
+        input.value = '{code=00123, id=9223372036854775807}'; app.doFormat();
+        const value = app.parseLosslessJson(input.value); equal(value.code, '00123');
+        equal(app.stringifyLosslessJson(value.id), '9223372036854775807');
+    });
+    check('all valid JSON root types can be downloaded', () => {
+        for (const raw of ['null','false','""','[]','{}','9223372036854775807']) {
+            app.replaceEditorText(raw); equal(app.getDownloadPayload().text, raw);
+        }
+    });
+    document.getElementById('results').textContent = results.join('\n');
+    document.body.dataset.status = results.some(line => line.startsWith('FAIL')) ? 'failed' : 'passed';
+};
+</script>
