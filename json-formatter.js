@@ -2,7 +2,6 @@
 let currentData = null;       // 当前解析成功的数据
 let currentType = null;       // 'json' | 'xml'
 let fixedContent = null;      // 智能修复后的内容
-const MAX_UNWRAP_DEPTH = 3;
 const inputArea = document.getElementById('inputArea');
 const mainContent = document.querySelector('.main-content');
 const inputPanel = document.querySelector('.input-panel');
@@ -11,6 +10,9 @@ const panelDivider = document.getElementById('panelDivider');
 const PANEL_MIN_WIDTH = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--panel-min-width'), 10) || 280;
 
 // ===== 初始化事件 =====
+inputArea.addEventListener('input', () => {
+    processingRevision++; cancelJsonTasks(); invalidateOutput(true); closeErrorPanel();
+});
 inputArea.addEventListener('input', debounce(onInputChange, 300));
 inputArea.addEventListener('scroll', syncLineNumbers);
 inputArea.addEventListener('keydown', handleTabKey);
@@ -18,7 +20,6 @@ document.addEventListener('keydown', e => {
     if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'f') { e.preventDefault(); doFormat(); }
 });
 initPanelResize();
-updateLineNumbers();
 
 // ===== 工具函数 =====
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
@@ -77,60 +78,256 @@ function decodeSingleQuotedString(raw) {
     return decoded;
 }
 
-function unwrapStructuredJsonString(raw) {
-    let candidate = raw.trim();
-    let wasUnwrapped = false;
-    for (let depth = 0; depth < MAX_UNWRAP_DEPTH; depth++) {
-        let parsed;
-        try {
-            parsed = JSON.parse(candidate);
-        } catch (e) {
-            if (!wasUnwrapped) {
-                const decoded = decodeSingleQuotedString(candidate);
-                if (decoded && isStructuredString(decoded)) {
-                    candidate = decoded;
-                    wasUnwrapped = true;
-                    continue;
-                }
-            }
-            throw e;
-        }
-        if (isStructuredString(parsed)) {
-            candidate = parsed.trim();
-            wasUnwrapped = true;
-            continue;
-        }
-        return { value: parsed, wasUnwrapped };
-    }
-    return { value: JSON.parse(candidate), wasUnwrapped };
-}
-
-function formatStructuredJson(raw, indent = 2) {
-    const parsed = unwrapStructuredJsonString(raw);
-    return {
-        value: parsed.value,
-        text: JSON.stringify(parsed.value, null, indent),
-        wasUnwrapped: parsed.wasUnwrapped
-    };
-}
-
 function getStructuredFixCandidate(raw) {
     try {
         const parsed = unwrapStructuredJsonString(raw);
-        return parsed.wasUnwrapped ? JSON.stringify(parsed.value, null, 2) : null;
+        return parsed.wasUnwrapped ? stringifyLosslessJson(parsed.value, null, 2) : null;
     } catch (e) {
         const decoded = decodeSingleQuotedString(raw);
         return isStructuredString(decoded) ? decoded.trim() : null;
     }
 }
 
+// Large JSON is parsed and serialized off the UI thread when Worker is available.
+const LARGE_JSON_SIZE = 256 * 1024;
+const MAX_INPUT_SIZE = 10 * 1024 * 1024;
+let processingRevision = 0;
+let jsonWorker = null, workerId = 0;
+const workerRequests = new Map();
+function cancelJsonTasks() {
+    if (jsonWorker) jsonWorker.terminate();
+    jsonWorker = null;
+    for (const task of workerRequests.values()) task.reject(new Error('操作已取消'));
+    workerRequests.clear();
+    document.getElementById('processingStatus').textContent = '';
+}
+function runJsonTask(raw, indent = 2, sort = false, returnData = true) {
+    if (!jsonWorker) {
+        try {
+            if (typeof Worker === 'undefined' || location.protocol === 'file:') throw new Error('Worker unavailable');
+            jsonWorker = new Worker('formatter-worker.js');
+            const worker = jsonWorker;
+            worker.onmessage = ({ data }) => {
+                const task = workerRequests.get(data.id);
+                if (!task) return;
+                workerRequests.delete(data.id);
+                if (data.error) task.reject(new Error(data.error));
+                else task.resolve(data);
+            };
+            worker.onerror = () => {
+                if (jsonWorker !== worker) return;
+                for (const task of workerRequests.values()) task.reject(new Error('后台线程不可用，请重新操作或使用本地 HTTP 服务'));
+                workerRequests.clear(); worker.terminate(); jsonWorker = null;
+            };
+        } catch (e) {
+            const parsed = unwrapStructuredJsonString(raw);
+            const value = sort ? sortObjectKeys(parsed.value) : parsed.value;
+            return Promise.resolve({ value, text: stringifyLosslessJson(value, null, indent), numbers: [] });
+        }
+    }
+    const id = ++workerId;
+    return new Promise((resolve, reject) => {
+        workerRequests.set(id, { resolve, reject });
+        jsonWorker.postMessage({ id, raw, indent, sort, returnData });
+    });
+}
+function restoreJsonNumbers(result) {
+    let root = result.value;
+    for (const path of result.numbers) {
+        if (!path.length) { root = new JsonNumber(root.source); continue; }
+        let parent = root;
+        for (let i = 0; i < path.length - 1; i++) parent = parent[path[i]];
+        const key = path[path.length - 1];
+        parent[key] = new JsonNumber(parent[key].source);
+    }
+    return root;
+}
+function setFormattedText(text, xml = false) {
+    const code = document.getElementById('formattedCode');
+    // Syntax highlighting creates many spans. Large results use plain text.
+    if (text.length >= LARGE_JSON_SIZE) code.textContent = text;
+    else if (xml) renderXmlOutput(text);
+    else code.innerHTML = highlightJson(text);
+}
+
+// Large trees retain a full data index but only mount a viewport of rows.
+let virtualTree = null;
+const TREE_ROW_HEIGHT = 28;
+function needsVirtualTree(value, xml = false) {
+    let count = 0;
+    const stack = xml ? Array.from(value.childNodes) : [value];
+    while (stack.length) {
+        const item = stack.pop();
+        if (++count > 1000 || (xml ? item.nodeValue?.length > 8192 : typeof item === 'string' && item.length > 8192)) return true;
+        if (xml) { for (const child of item.childNodes) stack.push(child); }
+        else if (item && typeof item === 'object' && !(item instanceof JsonNumber)) {
+            for (const key of Object.keys(item)) stack.push(item[key]);
+        }
+    }
+    return false;
+}
+function resetVirtualTree() {
+    virtualTree = null;
+    document.getElementById('treeOutput').classList.remove('virtual-mode');
+    document.getElementById('jsonTree').onscroll = null;
+}
+function mountVirtualTree(value, xml = false) {
+    resetVirtualTree();
+    const rows = [];
+    const stack = xml ? Array.from(value.childNodes).reverse().map(node => ({ value: node, path: '/' + node.nodeName + '[1]', parent: -1, depth: 0, preserve: false })) :
+        [{ value, path: '$', key: 'root', parent: -1, depth: 0 }];
+    while (stack.length) {
+        const item = stack.pop(), val = item.value;
+        if (xml && val.nodeType === Node.TEXT_NODE && !item.preserve && !val.nodeValue.trim()) continue;
+        const row = { ...item, id: rows.length, label: '', text: '', branch: false, type: '' };
+        rows.push(row);
+        if (!xml) {
+            row.label = item.parent < 0 ? '$' : JSON.stringify(item.key);
+            row.branch = val !== null && typeof val === 'object' && !(val instanceof JsonNumber);
+            if (row.branch) {
+                const keys = Object.keys(val), array = Array.isArray(val);
+                row.text = array ? `Array[${keys.length}]` : `Object{${keys.length}}`;
+                for (let i = keys.length - 1; i >= 0; i--) {
+                    const key = keys[i];
+                    stack.push({ value: val[key], key, parent: row.id, depth: row.depth + 1, path: item.path + (array ? `[${key}]` : `[${JSON.stringify(key)}]`) });
+                }
+            } else {
+                row.text = stringifyLosslessJson(val);
+                row.type = val instanceof JsonNumber || typeof val === 'number' ? 'json-number' : typeof val === 'string' ? 'json-string' : typeof val === 'boolean' ? 'json-bool' : 'json-null';
+            }
+        } else {
+            const element = val.nodeType === Node.ELEMENT_NODE;
+            const space = element ? val.getAttribute('xml:space') : null;
+            const preserve = space === null ? item.preserve : space === 'preserve';
+            row.label = element ? '<' + val.nodeName + '>' : val.nodeType === Node.TEXT_NODE ? '#text' : val.nodeType === Node.ATTRIBUTE_NODE ? '@' + val.name : val.nodeName;
+            row.text = element ? '' : val.nodeValue || new XMLSerializer().serializeToString(val);
+            row.type = 'xml-value';
+            const children = Array.from(val.childNodes).filter(child => preserve || child.nodeType !== Node.TEXT_NODE || child.nodeValue.trim());
+            const counts = new Map();
+            const entries = children.map(child => {
+                const name = child.nodeType === Node.TEXT_NODE ? 'text()' : child.nodeType === Node.COMMENT_NODE ? 'comment()' : child.nodeType === Node.CDATA_SECTION_NODE ? 'cdata()' : child.nodeName;
+                const index = (counts.get(name) || 0) + 1; counts.set(name, index);
+                return { value: child, path: item.path + '/' + name + '[' + index + ']', parent: row.id, depth: row.depth + 1, preserve };
+            });
+            if (element) entries.unshift(...Array.from(val.attributes).map(attr => ({ value: attr, path: item.path + '/@' + attr.name, parent: row.id, depth: row.depth + 1, preserve })));
+            row.branch = entries.length > 0;
+            for (let i = entries.length - 1; i >= 0; i--) stack.push(entries[i]);
+        }
+    }
+    virtualTree = { rows, xml, collapsed: new Set(rows.filter(row => row.branch && row.depth > 0).map(row => row.id)), visible: [], matches: [], matchIndex: -1 };
+    document.getElementById('treeOutput').classList.add('virtual-mode');
+    const container = document.getElementById('jsonTree');
+    container.scrollTop = 0;
+    container.onscroll = () => paintVirtualTree();
+    rebuildVirtualRows();
+    if (document.getElementById('searchInput').value.trim()) searchVirtualTree();
+    else clearSearch();
+}
+function rebuildVirtualRows() {
+    if (!virtualTree) return;
+    const { rows, collapsed } = virtualTree;
+    const hidden = [];
+    virtualTree.visible = rows.filter(row => {
+        hidden[row.id] = row.parent >= 0 && (hidden[row.parent] || collapsed.has(row.parent));
+        return !hidden[row.id];
+    });
+    paintVirtualTree();
+}
+function paintVirtualTree() {
+    if (!virtualTree) return;
+    const state = virtualTree, container = document.getElementById('jsonTree');
+    const height = container.clientHeight || 560;
+    container.scrollTop = Math.min(container.scrollTop, Math.max(0, state.visible.length * TREE_ROW_HEIGHT - height));
+    const start = Math.max(0, Math.floor(container.scrollTop / TREE_ROW_HEIGHT) - 5);
+    const end = Math.min(state.visible.length, start + Math.ceil(height / TREE_ROW_HEIGHT) + 12);
+    const fragment = document.createDocumentFragment();
+    const spacer = size => { const el = document.createElement('div'); el.style.height = size + 'px'; fragment.appendChild(el); };
+    spacer(start * TREE_ROW_HEIGHT);
+    const keyword = document.getElementById('searchInput').value.trim().toLowerCase();
+    const active = state.matches[state.matchIndex];
+    for (let i = start; i < end; i++) {
+        const row = state.visible[i];
+        const line = document.createElement('div');
+        line.className = 'tree-line virtual-row';
+        line.style.paddingLeft = (6 + Math.min(row.depth, 32) * 18) + 'px';
+        const toggle = document.createElement(row.branch ? 'button' : 'span');
+        toggle.className = 'tree-toggle';
+        toggle.textContent = row.branch ? '▼' : '';
+        if (row.branch) {
+            toggle.classList.toggle('collapsed', state.collapsed.has(row.id));
+            toggle.setAttribute('aria-expanded', String(!state.collapsed.has(row.id)));
+            toggle.setAttribute('aria-label', '展开或折叠 ' + row.path);
+            toggle.onclick = () => { if (!state.collapsed.delete(row.id)) state.collapsed.add(row.id); rebuildVirtualRows(); };
+        }
+        line.appendChild(toggle);
+        const field = (text, type) => {
+            const el = document.createElement('span');
+            el.className = type === 'key' ? 'tree-key' + (state.xml ? ' xml-tag' : '') : 'tree-value ' + row.type;
+            el.textContent = text.length > 500 ? text.slice(0, 500) + '…' : text;
+            el.dataset.path = row.path; el.dataset.searchType = type;
+            el.title = type === 'key' ? row.path : text.length > 500 ? text.slice(0, 500) + '…（复制可获取完整内容）' : text;
+            if (keyword && text.toLowerCase().includes(keyword)) el.classList.add(type === 'key' ? 'search-highlight' : 'search-highlight-value');
+            if (active?.id === row.id && active.type === type) { el.classList.add('active'); line.classList.add('active-match'); }
+            return el;
+        };
+        line.append(field(row.label, 'key'), field(row.text, 'value'));
+        const copy = document.createElement('button'); copy.className = 'tree-copy-btn'; copy.textContent = '复制';
+        copy.onclick = () => {
+            const val = row.value;
+            copyToClipboard(state.xml ? val.nodeType === Node.ELEMENT_NODE ? new XMLSerializer().serializeToString(val) : val.nodeValue || new XMLSerializer().serializeToString(val) : typeof val === 'string' ? val : stringifyLosslessJson(val, null, 2));
+        };
+        line.appendChild(copy); fragment.appendChild(line);
+    }
+    spacer(Math.max(0, state.visible.length - end) * TREE_ROW_HEIGHT);
+    container.replaceChildren(fragment);
+}
+function searchVirtualTree() {
+    const state = virtualTree;
+    const keyword = document.getElementById('searchInput').value.trim().toLowerCase();
+    state.matches = []; state.matchIndex = -1;
+    if (keyword) for (const row of state.rows) {
+        if (row.label.toLowerCase().includes(keyword)) state.matches.push({ id: row.id, type: 'key' });
+        if (!row.branch && row.text.toLowerCase().includes(keyword)) state.matches.push({ id: row.id, type: 'value' });
+    }
+    if (state.matches.length) { state.matchIndex = 0; activateVirtualMatch(); }
+    else {
+        document.getElementById('searchCount').textContent = keyword ? '无匹配' : '';
+        document.getElementById('searchPath').textContent = ''; paintVirtualTree();
+    }
+}
+function activateVirtualMatch() {
+    const state = virtualTree, match = state.matches[state.matchIndex];
+    if (!match) return;
+    const row = state.rows[match.id];
+    let parent = row.parent;
+    while (parent >= 0) { state.collapsed.delete(parent); parent = state.rows[parent].parent; }
+    rebuildVirtualRows();
+    const index = state.visible.findIndex(item => item.id === row.id);
+    const container = document.getElementById('jsonTree');
+    container.scrollTop = Math.max(0, index * TREE_ROW_HEIGHT - (container.clientHeight || 560) / 2);
+    paintVirtualTree();
+    document.getElementById('searchCount').textContent = `${state.matchIndex + 1}/${state.matches.length}`;
+    document.getElementById('searchPath').textContent = `${match.type === 'value' ? '值' : '字段'}：${row.path}`;
+}
+
 // ===== 输入变化处理 =====
 function onInputChange() {
+    rememberInput();
+    const revision = ++processingRevision;
+    cancelJsonTasks();
     const raw = inputArea.value.trim();
     updateLineNumbers();
     updateStats();
     if (!raw) {
         clearOutput();
+        return;
+    }
+    if (raw.length > MAX_INPUT_SIZE) {
+        invalidateOutput();
+        document.getElementById('errorPanel').classList.remove('hidden');
+        document.getElementById('fixSuggestion').classList.add('hidden');
+        document.getElementById('errorTitle').textContent = '内容过大';
+        document.getElementById('errorMessage').textContent = '内容超过 10 MiB，请拆分后处理';
         return;
     }
     // 自动识别类型并处理
@@ -141,7 +338,7 @@ function onInputChange() {
     document.getElementById('sortKeysButton').disabled = type !== 'json';
 
     if (type === 'json') {
-        processJson(raw);
+        processJson(raw, revision);
     } else if (type === 'xml') {
         processXml(raw);
     } else if (type === 'tostring') {
@@ -157,11 +354,11 @@ function detectType(s) {
     if (t.startsWith('<')) return 'xml';
     if (t.startsWith('{') || t.startsWith('[')) {
         // 优先尝试标准 JSON 解析
-        try { JSON.parse(s); return 'json'; } catch (e) { }
         // 检测 Java toString 格式：{key=value, key2=value2}
         if (/^\{[\s]*[\w.]+\s*=/.test(t)) return 'tostring';
         return 'json'; // 默认按 JSON 处理（可显示错误提示）
     }
+    if (t.startsWith('"')) return 'json';
     try { JSON.parse(s); return 'json'; } catch (e) { }
     if (/<\w/.test(s)) return 'xml';
     return 'unknown';
@@ -174,18 +371,22 @@ function updateStats() {
     document.getElementById('lineCount').textContent = v.split('\n').length + ' 行';
 }
 
+let numberedText = null, numberedLineCount = 1;
 function updateLineNumbers() {
-    const lines = inputArea.value.split('\n');
+    if (numberedText !== inputArea.value) { numberedText = inputArea.value; numberedLineCount = numberedText.split('\n').length; }
+    const count = numberedLineCount;
     const el = document.getElementById('lineNumbers');
-    el.innerHTML = lines.map((_, i) => `<div>${i + 1}</div>`).join('');
+    const start = Math.max(0, Math.floor(inputArea.scrollTop / 20.8) - 3);
+    const end = Math.min(count, start + Math.ceil((inputArea.clientHeight || 600) / 20.8) + 8);
+    el.innerHTML = `<div style="height:${start * 20.8}px"></div>` + Array.from({ length: Math.max(0, end - start) }, (_, i) => `<div>${start + i + 1}</div>`).join('') + `<div style="height:${Math.max(0, count - end) * 20.8}px"></div>`;
+    el.scrollTop = inputArea.scrollTop;
 }
 
-function syncLineNumbers() {
-    document.getElementById('lineNumbers').scrollTop = inputArea.scrollTop;
-}
+function syncLineNumbers() { updateLineNumbers(); }
 
 function handleTabKey(e) {
     if (e.key === 'Tab') {
+        rememberInput();
         e.preventDefault();
         const s = inputArea.selectionStart, end = inputArea.selectionEnd;
         inputArea.value = inputArea.value.substring(0, s) + '  ' + inputArea.value.substring(end);
@@ -195,24 +396,33 @@ function handleTabKey(e) {
 }
 
 // ===== JSON 处理 =====
-function processJson(raw) {
+async function processJson(raw, revision = processingRevision) {
     closeErrorPanel();
     try {
-        const parsed = formatStructuredJson(raw);
+        let parsed;
+        if (raw.length >= LARGE_JSON_SIZE) {
+            invalidateOutput(true);
+            document.getElementById('processingStatus').textContent = '后台处理中…';
+            const result = await runJsonTask(raw);
+            if (revision !== processingRevision || inputArea.value.trim() !== raw) return;
+            parsed = { value: restoreJsonNumbers(result), text: result.text };
+        } else parsed = formatStructuredJson(raw);
         currentData = parsed.value;
-        renderFormattedJson(parsed.value);
+        document.getElementById('sortKeysButton').disabled = currentType !== 'json';
+        setFormattedText(parsed.text);
         renderJsonTree(parsed.value);
-        // JSON 自动切换到树形视图，让用户直接看到可交互的树
         switchTab('tree');
     } catch (e) {
-        invalidateOutput();
-        showJsonError(raw, e);
+        if (revision !== processingRevision || inputArea.value.trim() !== raw) return;
+        invalidateOutput(); showJsonError(raw, e);
+    } finally {
+        if (revision === processingRevision) document.getElementById('processingStatus').textContent = '';
     }
 }
 
 function renderFormattedJson(obj, indent = 2) {
-    const formatted = JSON.stringify(obj, null, indent);
-    document.getElementById('formattedCode').innerHTML = highlightJson(formatted);
+    const formatted = stringifyLosslessJson(obj, null, indent);
+    setFormattedText(formatted);
 }
 
 function highlightJson(str) {
@@ -234,6 +444,8 @@ function highlightJson(str) {
 
 // ===== JSON 树形视图 =====
 function renderJsonTree(obj) {
+    if (needsVirtualTree(obj)) { mountVirtualTree(obj); return; }
+    resetVirtualTree();
     const container = document.getElementById('jsonTree');
     container.innerHTML = '';
     container.appendChild(buildTreeNode('root', obj, '$', true));
@@ -248,7 +460,7 @@ function buildTreeNode(key, value, parentPath, isRoot, parentIsArray = false) {
     const line = document.createElement('div');
     line.className = 'tree-line';
 
-    if (value !== null && typeof value === 'object') {
+    if (value !== null && typeof value === 'object' && !(value instanceof JsonNumber)) {
         const isArray = Array.isArray(value);
         const keys = Object.keys(value);
         const count = keys.length;
@@ -287,7 +499,7 @@ function buildTreeNode(key, value, parentPath, isRoot, parentIsArray = false) {
         copyBtn.textContent = '复制';
         copyBtn.onclick = (e) => {
             e.stopPropagation();
-            copyToClipboard(JSON.stringify(value, null, 2));
+            copyToClipboard(stringifyLosslessJson(value, null, 2));
         };
         line.appendChild(copyBtn);
 
@@ -321,9 +533,9 @@ function buildTreeNode(key, value, parentPath, isRoot, parentIsArray = false) {
         if (typeof value === 'string') {
             valEl.className += ' json-string';
             valEl.textContent = `"${value}"`;
-        } else if (typeof value === 'number') {
+        } else if (typeof value === 'number' || value instanceof JsonNumber) {
             valEl.className += ' json-number';
-            valEl.textContent = value;
+            valEl.textContent = value instanceof JsonNumber ? value.source : value;
         } else if (typeof value === 'boolean') {
             valEl.className += ' json-bool';
             valEl.textContent = value;
@@ -339,7 +551,7 @@ function buildTreeNode(key, value, parentPath, isRoot, parentIsArray = false) {
         copyBtn.textContent = '复制';
         copyBtn.onclick = (e) => {
             e.stopPropagation();
-            const copyVal = typeof value === 'string' ? value : JSON.stringify(value);
+            const copyVal = typeof value === 'string' ? value : stringifyLosslessJson(value);
             copyToClipboard(copyVal);
         };
         line.appendChild(copyBtn);
@@ -408,53 +620,93 @@ function showJsonError(raw, error) {
     }
 }
 
+// Repair syntax tokens only. String contents are never processed as code.
+function tokenizeRepairJson(raw) {
+    const tokens = [];
+    let pos = 0;
+    while (pos < raw.length) {
+        const start = pos, ch = raw[pos];
+        if (/\s/.test(ch)) { pos++; continue; }
+        if (raw.startsWith('//', pos)) {
+            const end = raw.indexOf('\n', pos + 2);
+            pos = end < 0 ? raw.length : end;
+            tokens.push({ type: 'comment', text: raw.slice(start, pos) }); continue;
+        }
+        if (raw.startsWith('/*', pos)) {
+            const end = raw.indexOf('*/', pos + 2);
+            if (end < 0) throw new Error('注释未闭合');
+            pos = end + 2; tokens.push({ type: 'comment', text: raw.slice(start, pos) }); continue;
+        }
+        if (ch === '"' || ch === "'") {
+            const quote = ch;
+            pos++;
+            let encoded = '"', closed = false;
+            while (pos < raw.length) {
+                const c = raw[pos++];
+                if (c === quote) { closed = true; break; }
+                if (c === '\\') {
+                    const next = raw[pos++];
+                    if (next === undefined) throw new Error('字符串未闭合');
+                    encoded += quote === "'" && next === "'" ? "'" : '\\' + next;
+                } else encoded += c === '"' ? '\\"' : c;
+            }
+            if (!closed) throw new Error('字符串未闭合');
+            encoded += '"';
+            // This also rejects unsupported escapes and literal control chars.
+            JSON.parse(encoded);
+            tokens.push({ type: 'string', text: quote === '"' ? raw.slice(start, pos) : encoded, single: quote === "'" });
+            continue;
+        }
+        if ('{}[]:,'.includes(ch)) { tokens.push({ type: ch, text: ch }); pos++; continue; }
+        const word = raw.slice(pos).match(/^(?:-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?|[\p{L}_$][\p{L}\p{N}_$-]*)/u);
+        if (!word) throw new Error('无法安全修复此标记');
+        pos += word[0].length;
+        tokens.push({ type: /^-?\d/.test(word[0]) ? 'number' : 'word', text: word[0] });
+    }
+    return tokens;
+}
+
 function tryAutoFix(raw) {
-    const fixes = [
-        { name: '解包字符串化 JSON', fn: s => getStructuredFixCandidate(s), desc: '将字符串化 JSON 自动反转义为标准 JSON' },
-        { name: '移除尾部逗号', fn: s => s.replace(/,\s*([\]}])/g, '$1'), desc: '移除了对象/数组末尾多余的逗号' },
-        { name: '单引号→双引号', fn: s => s.replace(/'/g, '"'), desc: '将单引号替换为标准的双引号' },
-        { name: '补全缺失引号', fn: s => s.replace(/{\s*(\w+)\s*:/g, '{"$1":').replace(/,\s*(\w+)\s*:/g, ',"$1":'), desc: '为未加引号的 Key 添加了双引号' },
-        { name: '移除注释', fn: s => s.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''), desc: '移除了 JSON 中不允许的注释' },
-        { name: '修复缺失逗号', fn: s => s.replace(/"\s*\n\s*"/g, '",\n"').replace(/}\s*\n\s*"/g, '},\n"').replace(/]\s*\n\s*"/g, '],\n"'), desc: '在相邻的元素之间补充了缺失的逗号' },
-        {
-            name: '补全括号', fn: s => {
-                let open = 0, close = 0;
-                for (const c of s) { if (c === '{') open++; if (c === '}') close++; }
-                if (open > close) return s + '}'.repeat(open - close);
-                open = 0; close = 0;
-                for (const c of s) { if (c === '[') open++; if (c === ']') close++; }
-                if (open > close) return s + ']'.repeat(open - close);
-                return null;
-            }, desc: '补全了缺失的闭合括号'
-        },
-    ];
-
-    // 组合修复：先尝试单个修复，再尝试组合
-    for (const fix of fixes) {
-        const result = fix.fn(raw);
-        if (result && result !== raw) {
-            try {
-                return { result: formatStructuredJson(result).text, description: fix.desc };
-            } catch (e) { }
+    // Do not rewrite a document which is already valid.
+    try { formatStructuredJson(raw); return null; } catch (e) { }
+    const unwrapped = getStructuredFixCandidate(raw);
+    if (unwrapped) {
+        try { return { result: formatStructuredJson(unwrapped).text, description: '解包字符串化 JSON' }; } catch (e) { }
+    }
+    try {
+        const source = tokenizeRepairJson(raw);
+        const descriptions = new Set();
+        if (source.some(token => token.type === 'comment')) descriptions.add('移除字符串外的注释');
+        if (source.some(token => token.single)) descriptions.add('转换单引号字符串');
+        const tokens = source.filter(token => token.type !== 'comment');
+        tokens.forEach((token, index) => {
+            if (token.type === 'word' && tokens[index + 1]?.type === ':') {
+                token.type = 'string'; token.text = JSON.stringify(token.text);
+                descriptions.add('为字段名补全双引号');
+            }
+        });
+        const output = [], stack = [];
+        for (const token of tokens) {
+            const previous = output[output.length - 1];
+            const endsValue = previous && (['string', 'number', '}', ']'].includes(previous.type) || previous.type === 'word' && /^(true|false|null)$/.test(previous.text));
+            const startsValue = ['string', 'number', '{', '['].includes(token.type) || token.type === 'word' && /^(true|false|null)$/.test(token.text);
+            if (endsValue && startsValue) { output.push({ type: ',', text: ',' }); descriptions.add('补全相邻值之间的逗号'); }
+            if (token.type === '{' || token.type === '[') stack.push(token.type === '{' ? '}' : ']');
+            if (token.type === '}' || token.type === ']') {
+                if (stack.pop() !== token.type) return null;
+                if (output[output.length - 1]?.type === ',') { output.pop(); descriptions.add('移除末尾逗号'); }
+            }
+            output.push(token);
         }
-    }
-
-    // 尝试组合修复
-    let combined = raw;
-    const appliedFixes = [];
-    for (const fix of fixes) {
-        const r = fix.fn(combined);
-        if (r && r !== combined) {
-            combined = r;
-            appliedFixes.push(fix.desc);
+        if (stack.length) {
+            if (output[output.length - 1]?.type === ',') output.pop();
+            descriptions.add('补全缺失的闭合括号');
+            while (stack.length) output.push({ text: stack.pop() });
         }
-    }
-    if (combined !== raw) {
-        try {
-            return { result: formatStructuredJson(combined).text, description: '组合修复：' + appliedFixes.join('；') };
-        } catch (e) { }
-    }
-    return null;
+        const candidate = output.map(token => token.text).join(' ');
+        if (!descriptions.size) return null;
+        return { result: formatStructuredJson(candidate).text, description: Array.from(descriptions).join('；') };
+    } catch (e) { return null; }
 }
 
 function renderDiff(original, fixed, description) {
@@ -465,7 +717,6 @@ function renderDiff(original, fixed, description) {
     // 简化 diff：展示修复后的结果，标注修改的行
     const maxShow = 30;
     const oldSet = new Set(oldLines.map(l => l.trim()));
-    const newSet = new Set(newLines.map(l => l.trim()));
 
     html += '<div>';
     const showLines = newLines.slice(0, maxShow);
@@ -485,9 +736,9 @@ function renderDiff(original, fixed, description) {
 }
 
 function applyFix() {
+    rememberInput();
     if (fixedContent) {
-        inputArea.value = fixedContent;
-        onInputChange();
+        if (!replaceEditorText(fixedContent)) return;
         showToast('✓ 已应用智能修复');
     }
 }
@@ -502,7 +753,7 @@ function processXml(raw) {
     try {
         const doc = parseXmlDocument(raw);
         currentData = doc;
-        renderXmlOutput(formatXmlFromDocument(doc, raw));
+        setFormattedText(formatXmlFromDocument(doc, raw), true);
         renderXmlTree(doc);
         switchTab('tree');
     } catch (e) {
@@ -511,9 +762,16 @@ function processXml(raw) {
     }
 }
 
+let xmlErrorSignature = null;
 function parseXmlDocument(raw) {
-    const doc = new DOMParser().parseFromString(raw, 'application/xml');
-    const errorNode = doc.getElementsByTagNameNS('http://www.mozilla.org/newlayout/xml/parsererror.xml', 'parsererror')[0];
+    const parser = new DOMParser();
+    if (!xmlErrorSignature) {
+        const probe = parser.parseFromString('<', 'application/xml').getElementsByTagName('parsererror')[0];
+        xmlErrorSignature = { namespace: probe?.namespaceURI, style: probe?.getAttribute('style') };
+    }
+    const doc = parser.parseFromString(raw, 'application/xml');
+    const errorNode = Array.from(doc.getElementsByTagNameNS(xmlErrorSignature.namespace || '*', 'parsererror'))
+        .find(node => node.getAttribute('style') === xmlErrorSignature.style);
     if (errorNode) throw new Error(errorNode.textContent);
     return doc;
 }
@@ -606,6 +864,8 @@ function minifyXml(raw) {
 }
 
 function renderXmlTree(doc) {
+    if (needsVirtualTree(doc, true)) { mountVirtualTree(doc, true); return; }
+    resetVirtualTree();
     const container = document.getElementById('jsonTree');
     container.replaceChildren();
     function build(node, path, inheritedPreserve = false) {
@@ -685,12 +945,16 @@ function renderXmlTree(doc) {
     else clearSearch();
 }
 
-function invalidateOutput() {
+function invalidateOutput(preserveQuery = false) {
+    const query = preserveQuery ? document.getElementById('searchInput').value : '';
+    resetVirtualTree();
+    document.getElementById('sortKeysButton').disabled = true;
     currentData = null;
     fixedContent = null;
     document.getElementById('formattedCode').replaceChildren();
     document.getElementById('jsonTree').replaceChildren();
     clearSearch();
+    if (preserveQuery) document.getElementById('searchInput').value = query;
 }
 
 function renderXmlOutput(xml) {
@@ -787,7 +1051,7 @@ function processToString(raw) {
         }
         currentData = obj;
         // 转换为 JSON 格式展示
-        const jsonStr = JSON.stringify(obj, null, 2);
+        const jsonStr = stringifyLosslessJson(obj, null, 2);
         document.getElementById('formattedCode').innerHTML = highlightJson(jsonStr);
         renderJsonTree(obj);
         switchTab('tree');
@@ -822,7 +1086,7 @@ function parseJavaToString(input) {
     function parseObject() {
         if (input[pos] !== '{') return null;
         pos++; // 跳过 '{'
-        const obj = {};
+        const obj = Object.create(null);
 
         while (pos < input.length) {
             skipWhitespace();
@@ -921,7 +1185,7 @@ function parseJavaToString(input) {
         if (val === 'null') return null;
         if (val === 'true') return true;
         if (val === 'false') return false;
-        if (/^-?\d+(\.\d+)?$/.test(val)) return Number(val);
+        if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(val)) return parseLosslessJson(val);
         return val;
     }
 
@@ -935,81 +1199,71 @@ function parseJavaToString(input) {
 
 // ===== 工具栏操作 =====
 function doFormat() {
+    rememberInput();
     const raw = inputArea.value.trim();
     if (!raw) return;
     const type = detectType(raw);
+    if (type === 'json' && raw.length >= LARGE_JSON_SIZE) { return performLargeJsonOperation(raw, 2); }
     if (type === 'json') {
         try {
-            inputArea.value = formatStructuredJson(raw).text;
-            onInputChange();
+            if (!replaceEditorText(formatStructuredJson(raw).text)) return;
             showToast('✓ JSON 格式化完成');
         } catch (e) { processJson(raw); }
     } else if (type === 'xml') {
         try {
-            inputArea.value = formatXml(raw);
-            onInputChange();
+            if (!replaceEditorText(formatXml(raw))) return;
             showToast('✓ XML 格式化完成');
         } catch (e) { showXmlError(raw, e.message); }
     } else if (type === 'tostring') {
         // 将 Java toString 格式转换为格式化的 JSON
         try {
             const obj = parseJavaToString(raw);
-            inputArea.value = JSON.stringify(obj, null, 2);
-            onInputChange();
+            if (!replaceEditorText(stringifyLosslessJson(obj, null, 2))) return;
             showToast('✓ 已转换为 JSON 格式');
         } catch (e) { processToString(raw); }
     }
 }
 
 function doMinify() {
+    rememberInput();
     const raw = inputArea.value.trim();
     if (!raw) return;
     const type = detectType(raw);
+    if (type === 'json' && raw.length >= LARGE_JSON_SIZE) { return performLargeJsonOperation(raw, 0); }
     if (type === 'json') {
         try {
-            inputArea.value = formatStructuredJson(raw, 0).text;
-            onInputChange();
+            if (!replaceEditorText(formatStructuredJson(raw, 0).text)) return;
             showToast('✓ JSON 已压缩');
         } catch (e) { processJson(raw); }
     } else if (type === 'xml') {
         try {
-            inputArea.value = minifyXml(raw);
-            onInputChange();
+            if (!replaceEditorText(minifyXml(raw))) return;
             showToast('✓ XML 已压缩');
         } catch (e) { showXmlError(raw, e.message); }
     } else if (type === 'tostring') {
         try {
             const obj = parseJavaToString(raw);
-            inputArea.value = JSON.stringify(obj);
-            onInputChange();
+            if (!replaceEditorText(stringifyLosslessJson(obj))) return;
             showToast('✓ 已转换并压缩为 JSON');
         } catch (e) { processToString(raw); }
     }
 }
 
 function doSortKeys() {
-    if (!currentData || currentType !== 'json') {
-        showToast('⚠️ 请先输入有效的 JSON');
-        return;
-    }
-    const sorted = sortObjectKeys(currentData);
-    inputArea.value = JSON.stringify(sorted, null, 2);
-    onInputChange();
-    showToast('✓ 已按 Key 字母排序');
-}
-
-function sortObjectKeys(obj) {
-    if (Array.isArray(obj)) return obj.map(sortObjectKeys);
-    if (obj !== null && typeof obj === 'object') {
-        return Object.keys(obj).sort((a, b) => a.localeCompare(b))
-            .reduce((acc, key) => { acc[key] = sortObjectKeys(obj[key]); return acc; }, {});
-    }
-    return obj;
+    rememberInput();
+    const raw = inputArea.value.trim();
+    if (detectType(raw) !== 'json') { showToast('请先输入有效的 JSON'); return; }
+    if (raw.length >= LARGE_JSON_SIZE) return performLargeJsonOperation(raw, 2, true);
+    try {
+        if (!replaceEditorText(stringifyLosslessJson(sortObjectKeys(formatStructuredJson(raw).value), null, 2))) return;
+        showToast('✓ 已按 Key 字母排序');
+    } catch (e) { invalidateOutput(); showJsonError(raw, e); }
 }
 
 function doCollapseAll() {
     // 自动切换到树形视图
     switchTab('tree');
+    if (virtualTree) { virtualTree.collapsed = new Set(virtualTree.rows.filter(row => row.branch).map(row => row.id)); rebuildVirtualRows(); return; }
     document.querySelectorAll('#jsonTree .tree-children').forEach(el => el.classList.add('collapsed'));
     document.querySelectorAll('#jsonTree .tree-toggle').forEach(el => { el.classList.add('collapsed'); el.setAttribute('aria-expanded', 'false'); });
     showToast('✓ 已折叠全部节点');
@@ -1018,6 +1272,7 @@ function doCollapseAll() {
 function doExpandAll() {
     // 自动切换到树形视图
     switchTab('tree');
+    if (virtualTree) { virtualTree.collapsed.clear(); rebuildVirtualRows(); return; }
     document.querySelectorAll('#jsonTree .tree-children').forEach(el => el.classList.remove('collapsed'));
     document.querySelectorAll('#jsonTree .tree-toggle').forEach(el => { el.classList.remove('collapsed'); el.setAttribute('aria-expanded', 'true'); });
     showToast('✓ 已展开全部节点');
@@ -1030,13 +1285,16 @@ function doCopyAll() {
 }
 
 function doClear() {
+    rememberInput();
     inputArea.value = '';
+    onInputChange();
     clearOutput();
     closeErrorPanel();
     showToast('✓ 已清空');
 }
 
 function clearOutput() {
+    resetVirtualTree();
     document.getElementById('formattedCode').innerHTML = '';
     document.getElementById('jsonTree').innerHTML = '';
     document.getElementById('dataType').textContent = '未检测';
@@ -1051,12 +1309,14 @@ function clearOutput() {
 
 // ===== Tab 切换 =====
 function switchTab(tab) {
+    if (virtualTree && tab === 'tree') paintVirtualTree();
     document.querySelectorAll('.tab').forEach(el => el.classList.toggle('active', el.dataset.tab === tab));
     document.querySelectorAll('.output-content').forEach(el => el.classList.toggle('active', el.id === tab + 'Output'));
 }
 
 // ===== 加载示例 =====
 function loadSample() {
+    rememberInput();
     if (document.getElementById('sampleType').value === 'xml') {
         inputArea.value = `<?xml version="1.0" encoding="UTF-8"?>
 <orders xmlns="urn:orders" xmlns:pay="urn:payment">
@@ -1177,6 +1437,7 @@ let searchMatches = [];   // 匹配到的 DOM 元素列表
 let searchIndex = -1;     // 当前高亮的索引
 
 function onSearchInput() {
+    if (virtualTree) { searchVirtualTree(); return; }
     const keyword = document.getElementById('searchInput').value.trim().toLowerCase();
     // 清除上一次高亮
     clearSearchHighlights();
@@ -1218,6 +1479,7 @@ function onSearchInput() {
 }
 
 function searchNext() {
+    if (virtualTree) { if (virtualTree.matches.length) { virtualTree.matchIndex = (virtualTree.matchIndex + 1) % virtualTree.matches.length; activateVirtualMatch(); } return; }
     if (searchMatches.length === 0) return;
     searchIndex = (searchIndex + 1) % searchMatches.length;
     activateSearchMatch(searchIndex);
@@ -1225,6 +1487,7 @@ function searchNext() {
 }
 
 function searchPrev() {
+    if (virtualTree) { if (virtualTree.matches.length) { virtualTree.matchIndex = (virtualTree.matchIndex - 1 + virtualTree.matches.length) % virtualTree.matches.length; activateVirtualMatch(); } return; }
     if (searchMatches.length === 0) return;
     searchIndex = (searchIndex - 1 + searchMatches.length) % searchMatches.length;
     activateSearchMatch(searchIndex);
@@ -1264,6 +1527,7 @@ function getSearchType(el) {
 
 function clearSearch() {
     document.getElementById('searchInput').value = '';
+    if (virtualTree) { virtualTree.matches = []; virtualTree.matchIndex = -1; paintVirtualTree(); }
     document.getElementById('searchCount').textContent = '';
     document.getElementById('searchPath').textContent = '';
     clearSearchHighlights();
@@ -1299,3 +1563,5 @@ document.getElementById('searchInput').addEventListener('keydown', e => {
         if (e.shiftKey) searchPrev(); else searchNext();
     }
 });
+
+updateLineNumbers();
